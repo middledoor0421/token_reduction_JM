@@ -1,6 +1,6 @@
 # main.py
 # Entrypoint with plugin registry routing.
-# - Supports identity / tome_ours / ours
+# - Supports identity / tome_adapter / ours
 # - Progress bar + final Top-1 (%)
 # - Optional KL/Δmargin vs identity (subset), FLOPs print
 
@@ -167,12 +167,12 @@ def main():
 
     # ...
     plugin_cfg = {
-        "layers": args.layers,
-        "keep": args.keep,  # 단일 값 또는 CSV로 받은 keep 비율
-        "r": args.r,
+        "layers": args.layers,  # e.g. "all" or "0,1,2"
+        "r": int(args.r),
+        "match-feature": args.match_feature,  # 'k' or 'xnorm'
     }
 
-    if args.method == "tome_ours":
+    if args.method == "tome_adapter":
         plugin_cfg.update({
             "match_feature": args.match_feature,  # 예: 'k', 'xnorm'
             "prop_attn": bool(args.prop_attn),  # Propagation attention 여부
