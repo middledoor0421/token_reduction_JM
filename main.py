@@ -168,13 +168,14 @@ def main():
     # ...
     plugin_cfg = {
         "layers": args.layers,
-        "keep": args.keep,  # 문자열 그대로 전달 (단일/CSV 모두 허용)
+        "keep": args.keep,  # 단일 값 또는 CSV로 받은 keep 비율
         "r": args.r,
     }
+
     if args.method == "tome":
         plugin_cfg.update({
-            "match_feature": args.match_feature,
-            "prop_attn": bool(args.prop_attn),
+            "match_feature": args.match_feature,  # 예: 'k', 'xnorm'
+            "prop_attn": bool(args.prop_attn),  # Propagation attention 여부
         })
     if args.method == "ours":
         plugin_cfg.update({
