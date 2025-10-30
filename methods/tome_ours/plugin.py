@@ -1,4 +1,4 @@
-# methods/tome/plugin.py
+# methods/tome_ours/plugin.py
 from typing import Optional
 import torch
 import torch.nn as nn
@@ -12,7 +12,7 @@ class IdentityDrop(nn.Module):
     def forward(self, x):
         return x
 
-@register("tome")
+@register("tome_ours")
 class TomePlugin:
     def __init__(self, cfg):
         self.cfg = dict(cfg or {})

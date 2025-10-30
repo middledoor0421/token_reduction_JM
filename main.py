@@ -1,6 +1,6 @@
 # main.py
 # Entrypoint with plugin registry routing.
-# - Supports identity / tome / ours
+# - Supports identity / tome_ours / ours
 # - Progress bar + final Top-1 (%)
 # - Optional KL/Δmargin vs identity (subset), FLOPs print
 
@@ -172,7 +172,7 @@ def main():
         "r": args.r,
     }
 
-    if args.method == "tome":
+    if args.method == "tome_ours":
         plugin_cfg.update({
             "match_feature": args.match_feature,  # 예: 'k', 'xnorm'
             "prop_attn": bool(args.prop_attn),  # Propagation attention 여부
