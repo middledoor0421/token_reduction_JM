@@ -1,12 +1,10 @@
-# Python 3.9 compatible (no '|'), comments in English
+# methods/tome_adapter/plugin.py
 from typing import List
 import importlib
-from core.registry import TokenReducerPlugin, register
+from core.registry import TokenReducerPlugin, register   # ensure base name matches your registry
 
-def _parse_layers(spec: str, total: int) -> List[int]:
-    if spec is None:
-        return []
-    s = str(spec).strip().lower()
+def _parse_layers(spec, total):
+    s = str(spec).strip().lower() if spec is not None else ""
     if s == "" or s == "all":
         return list(range(total))
     out = []
@@ -17,48 +15,36 @@ def _parse_layers(spec: str, total: int) -> List[int]:
     return out
 
 @register("tome")
-class TomePlugin(TokenReducerPlugin):  # if your base is TokenReducerPlugin, use that
-    def __init__(self, cfg: dict):
-        super().__init__(cfg)
+class TomePlugin(TokenReducerPlugin):  # fix base class name
+    def __init__(self, cfg):
+        super(TomePlugin, self).__init__(cfg)
         self.cfg = dict(cfg or {})
         self.r = int(self.cfg.get("r", 0))
         self.layer_spec = str(self.cfg.get("layers", "all"))
         self.provider = str(self.cfg.get("match-feature", "k"))  # 'k' or 'xnorm'
 
     def attach(self, model):
-        # import upstream `tome` from project root (copied from facebookresearch/ToMe)
         tome = importlib.import_module("tome")
+        patch = getattr(tome, "patch", None)
+        if patch is None or not hasattr(patch, "timm"):
+            raise RuntimeError("Upstream 'tome.patch.timm' not found. Ensure ./tome is present.")
+        # Apply upstream patch
+        patch.timm(model, trace_source=False)
 
-        # find patch entrypoint; upstream exposes `tome.patch.timm`
-        patch_mod = getattr(tome, "patch", None)
-        if patch_mod is None or not hasattr(patch_mod, "timm"):
-            raise RuntimeError("Upstream 'tome.patch.timm' not found. Make sure ./tome is copied.")
-
-        # apply in-place patch to vendored timm model
-        # some versions accept `trace_source`; pass False by default
-        patch_mod.timm(model, trace_source=False)
-
-        # global r flag (upstream ToMe reads `model.r`)
+        # Global r
         setattr(model, "r", self.r)
 
-        # per-block r (only enable on selected `layers`)
+        # Per-layer r
         blocks = getattr(model, "blocks", [])
-        use = _parse_layers(self.layer_spec, len(blocks))
         for i, blk in enumerate(blocks):
             attn = getattr(blk, "attn", None)
             if hasattr(attn, "r"):
-                setattr(attn, "r", self.r if i in use else 0)
+                setattr(attn, "r", self.r if i in _parse_layers(self.layer_spec, len(blocks)) else 0)
 
-        # best-effort provider hint (some ToMe versions read this dict)
-        try:
-            info = getattr(model, "tome_info", None)
-            if info is None:
-                info = {}
-                setattr(model, "tome_info", info)
-            info["provider"] = "k" if self.provider == "k" else "xnorm"
-        except Exception:
-            pass
+        # Optional provider hint (ignored if not used upstream)
+        info = getattr(model, "tome_info", None) or {}
+        info["provider"] = "k" if self.provider == "k" else "xnorm"
+        setattr(model, "tome_info", info)
 
     def finalize(self):
-        # no-op; upstream ToMe already modified the model
         return

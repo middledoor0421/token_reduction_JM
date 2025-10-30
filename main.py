@@ -167,9 +167,9 @@ def main():
 
     # ...
     plugin_cfg = {
-        "layers": args.layers,  # e.g. "all" or "0,1,2"
+        "layers": args.layers,  # "all" or "0,1,2"
         "r": int(args.r),
-        "match-feature": args.match_feature,  # 'k' or 'xnorm'
+        "match-feature": args.maybe_get("match_feature") if hasattr(args, "match_feature") else "k",
     }
 
     if args.method == "tome_adapter":
