@@ -127,8 +127,10 @@ def parse_args():
     ap.add_argument("--layers", type=str, default="0,1,2",
                     help="Comma-separated block indices to apply reduction ('' for all)")
     # NOTE: keep을 문자열로 받아 레이어별 비율을 지원 (예: '0.90,0.85,0.80' 또는 '0.68')
-    ap.add_argument("--keep", type=str, default="0.68",
-                    help="Keep ratio. Either a single float '0.68' or per-layer list like '0.90,0.85,0.80'")
+    ap.add_argument("--keep", type=str, default=None,
+                    help="Optional keep ratio(s) for methods that use keep (e.g., --method ours). "
+                         "Comma-separated per-layer or single float. Omit for r-driven modes.")
+
     ap.add_argument("--max-samples", type=int, default=0)
 
     # ToMe 전용
@@ -136,13 +138,23 @@ def parse_args():
     ap.add_argument("--match-feature", type=str, default="k", choices=["k", "xnorm"])
     ap.add_argument("--prop-attn", action="store_true", default=False)
 
-    # Ours 전용
-    ap.add_argument("--selector", type=str, default="hquota_ff",
-                    help="ff | topk | random | facility | kdpp | hquota_ff")
-    ap.add_argument("--hq-q", type=float, default=0.3, dest="hq_q")
-    ap.add_argument("--gamma", type=float, default=0.0)
-    ap.add_argument("--cand-extra", type=int, default=128, dest="cand_extra")
-    ap.add_argument("--drop", action="store_true", default=False)
+    # --- argparse 추가 (ours 전용) ---
+    ap.add_argument("--selector", type=str, default="hquota_ff")  # ours
+    ap.add_argument("--hq-q", type=float, default=0.3, dest="hq_q")  # ours
+    ap.add_argument("--gamma", type=float, default=0.0)  # ours
+    ap.add_argument("--cand-extra", type=int, default=128, dest="cand_extra")  # ours
+
+    ap.add_argument("--merge", type=str, default="kv", choices=["kv", "v"])  # ours
+    ap.add_argument("--alpha", type=float, default=0.15)  # ours (push-lite)
+    ap.add_argument("--beta0", type=float, default=0.5)  # ours
+    ap.add_argument("--top-r", type=int, default=0)  # ours
+
+    ap.add_argument("--l2-clip-tau", type=float, default=0.0, dest="l2_clip_tau")  # ours
+    ap.add_argument("--temp-eta", type=float, default=0.0, dest="temp_eta")  # ours
+    ap.add_argument("--size-delta", type=float, default=0.0, dest="size_delta")  # ours
+
+    ap.add_argument("--schedule", type=str, default="early_bias")  # ours
+    ap.add_argument("--log-coverage", action="store_true", default=False)  # ours
 
     # metrics/flops
     ap.add_argument("--metrics-samples", type=int, default=1000)
@@ -166,16 +178,37 @@ def main():
         print(f"[flops] ~{gmacs:.2f} GMACs, params={params/1e6:.1f}M")
 
     # ...
-    plugin_cfg = {
-        "layers": args.layers,  # "all" or "0,1,2"
-        "r": int(args.r),
-        "match-feature": args.maybe_get("match_feature") if hasattr(args, "match_feature") else "k",
-    }
+    plugin_cfg = {"layers": args.layers}
 
-    if args.method == "tome_adapter":
+    if args.method == "tome":
         plugin_cfg.update({
-            "match_feature": args.match_feature,  # 예: 'k', 'xnorm'
-            "prop_attn": bool(args.prop_attn),  # Propagation attention 여부
+            "r": int(args.r),
+            "eager": getattr(args, "eager", False),  # (있다면)
+            "match-feature": getattr(args, "match_feature", "k")  # only for ToMe
+        })
+    elif args.method == "ours":
+        # 우리 베이스라인 전용 옵션만 선택적으로 추가
+        plugin_cfg.update({
+            # core
+            "r": int(args.r),
+            "keep": args.keep,
+            "match_feature": getattr(args, "match_feature", "k"),
+            # selector
+            "selector": args.selector,
+            "hq_q": args.hq_q,
+            "gamma": args.gamma,
+            "cand_extra": args.cand_extra,
+            # merge/norm
+            "merge": args.merge,
+            "alpha": args.alpha,
+            "beta0": args.beta0,
+            "top_r": args.top_r,
+            "l2_clip_tau": args.l2_clip_tau,
+            "temp_eta": args.temp_eta,
+            "size_delta": args.size_delta,
+            # schedule/logging
+            "schedule": args.schedule,
+            "log_coverage": bool(args.log_coverage),
         })
     if args.method == "ours":
         plugin_cfg.update({
