@@ -1,193 +1,167 @@
-# methods/ours/selectors/hquota_ff.py
-# Head-diversity selector: hub-quota seeds + farthest-first completion.
-# Inputs:
-#   metric:  [B, H, T, D]  (e.g., normalized K per head; if you pass [B,T,C], unsqueeze to [B,1,T,C])
-#   size:    [B, T] or None (token sizes; default = 1)
-#   r_block: int (number of tokens to merge in this block)
-#   q:       float in (0,1], fraction of seeds from hub quota
-#   gamma:   float, hub score exponent for size (score *= size^gamma)
-#   cls_protect: bool (protect token index 0)
-#   cand_extra: int, optional extra candidate pool for speed/quality trade-off
-# Returns:
-#   keep_idx:   LongTensor [B, K] (K = T - r_block), sorted by construction (CLS first if protected)
-#   assign_idx: LongTensor [B, T] mapping each token -> its kept representative (self for kept)
+# methods/ours/selectors/hquota.py
+# Head-diversity selectors for "Ours".
+# Final signature for exported selector:  select(phi, K) -> (keep_idx[B,K], assign_idx[B,T])
+#   - phi : [B, T, H]  (L2-normalized head-profile per token; e.g., attn-in per head)
+#   - K   : int, number of tokens to keep at this layer
 #
-# Notes:
-# - Greedy farthest-first is O(K*T*H) in worst case; implemented in PyTorch with simple loops over K.
-# - This is a selector only; pairing/merge is handled elsewhere.
+# We provide:
+#   * _farthest_first(phi, K) -> (keep_idx, assign_idx)
+#   * select_hquota_ff(phi, K, q=0.3) -> (keep_idx, assign_idx)
+#   * get_selector(name, q=0.3) -> callable `(phi, K) -> (keep_idx, assign_idx)`
 
-from typing import Tuple
+from typing import Tuple, Callable
 import torch
 import torch.nn.functional as F
-from . import register_selector
 
 
-def _ensure_shapes(metric: torch.Tensor, size: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    # metric: [B,H,T,D] required
-    if metric.dim() == 3:  # [B,T,C] -> [B,1,T,C]
-        metric = metric.unsqueeze(1)
-    assert metric.dim() == 4, "metric must be [B,H,T,D] or [B,T,C]"
-    B, H, T, D = metric.shape
-    if size is None:
-        size = metric.new_ones(B, T)
-    assert size.shape == (B, T), "size must be [B,T]"
-    return metric, size
-
-
-def _head_signature(metric: torch.Tensor) -> torch.Tensor:
-    # phi: per-token head profile using L2 norm across D: [B,H,T,D] -> [B,T,H]
-    # normalize per-head then across heads for stability.
-    B, H, T, D = metric.shape
-    m = torch.norm(metric, dim=-1)           # [B,H,T]
-    m = F.normalize(m, dim=2, eps=1e-6)      # per-head token norm
-    phi = m.transpose(1, 2).contiguous()     # [B,T,H]
-    phi = F.normalize(phi, dim=2, eps=1e-6)  # across-head normalization
-    return phi
-
-
-def _strength(phi: torch.Tensor, size: torch.Tensor, gamma: float) -> torch.Tensor:
-    # global hub strength with optional size^gamma
-    # phi: [B,T,H], size: [B,T]
-    s = torch.sum(phi, dim=2)  # [B,T]
-    if gamma != 0.0:
-        s = s * torch.clamp(size, min=1e-6).pow(gamma)
-    return s
-
-
-def _farthest_first(phi: torch.Tensor,
-                    seeds: torch.Tensor,
-                    K: int,
-                    protect0: bool) -> torch.Tensor:
-    # Greedy farthest-first in cosine distance on phi.
-    # phi: [B,T,H], seeds: [B,S], return keep_idx [B,K] (CLS at front if protect0)
+def _farthest_first(phi: torch.Tensor, K: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Greedy farthest-first on token head-profiles.
+    Args:
+        phi: [B,T,H] L2-normalized along last dim.
+        K:   number of tokens to keep (>=1, <=T).
+    Returns:
+        keep_idx:   [B,K] absolute indices of kept tokens
+        assign_idx:[B,T] for each token, index (0..K-1) of its nearest kept token
+    """
     B, T, H = phi.shape
+    K = max(1, min(int(K), T))
     device = phi.device
-    kept = torch.full((B, K), -1, dtype=torch.long, device=device)
 
-    # Init kept with seeds (cap at K)
-    S = min(seeds.shape[1], K)
-    if S > 0:
-        kept[:, :S] = seeds[:, :S]
+    # Cosine similarity among tokens
+    # S[b,i,j] = <phi[b,i], phi[b,j]>
+    S = torch.einsum("bih,bjh->bij", phi, phi)  # [B,T,T]
 
-    # Precompute cosine similarities between all tokens
-    # sim[b, i, j] = cos(phi[b,i], phi[b,j])
-    # We incrementally track min distance to current kept set.
-    phi_b = phi  # [B,T,H]
-    sim = torch.matmul(phi_b, phi_b.transpose(1, 2))  # [B,T,T]
-    sim = torch.clamp(sim, -1.0, 1.0)
-    dist = 1.0 - sim  # cosine distance
+    # Always keep CLS at position 0
+    keep = torch.empty((B, K), dtype=torch.long, device=device)
+    keep[:, 0] = 0
 
-    # Initialize current min distance to inf; then update with seeds
-    cur_min = torch.full((B, T), float("inf"), device=device)
-    if S > 0:
-        for s_idx in range(S):
-            k_idx = kept[:, s_idx]  # [B]
-            # gather distance to this kept token: dist[b, :, k_idx[b]]
-            d = torch.stack([dist[b, :, k_idx[b]] for b in range(B)], dim=0)  # [B,T]
-            cur_min = torch.minimum(cur_min, d)
+    # Track chosen set per batch
+    chosen = torch.zeros((B, T), dtype=torch.bool, device=device)
+    chosen[:, 0] = True
 
-    # If protecting CLS(0), mark it as already kept if not present and reserve slot 0
-    if protect0:
-        # If CLS not in first S, ensure it is included and positioned at 0.
-        need_cls = (kept[:, :S] != 0).all(dim=1) if S > 0 else torch.ones(B, dtype=torch.bool, device=device)
-        for b in range(B):
-            if need_cls[b]:
-                # shift right if needed
-                if S < K:
-                    if S > 0:
-                        kept[b, 1:S+1] = kept[b, 0:S]
-                    kept[b, 0] = 0
-                    S = min(S + 1, K)
-                else:
-                    kept[b, 0] = 0
-        # update cur_min with CLS
-        d_cls = dist[:, :, 0]  # [B,T]
-        cur_min = torch.minimum(cur_min, d_cls)
+    # best similarity of each token to current kept set
+    best_sim = S[:, 0, :]  # [B,T]
 
-    # Greedy fill remaining
-    start = S
-    for tpos in range(start, K):
-        # pick argmax of current min distance (farthest from kept set)
-        nxt = torch.argmax(cur_min, dim=1)  # [B]
-        kept[:, tpos] = nxt
-        # update cur_min with new kept
-        d_new = torch.stack([dist[b, :, nxt[b]] for b in range(B)], dim=0)  # [B,T]
-        cur_min = torch.minimum(cur_min, d_new)
+    for m in range(1, K):
+        cands = best_sim.masked_fill(chosen, float("inf"))
+        nxt = torch.argmin(cands, dim=1)        # farthest (min cosine) from current set
+        keep[:, m] = nxt
+        chosen.scatter_(1, nxt.unsqueeze(1), True)
+        # update best similarity with new center
+        upd = S[torch.arange(B, device=device), nxt][:, :]
+        best_sim = torch.maximum(best_sim, upd)
 
-    # Deduplicate (rare edge): enforce uniqueness by stable set semantics
-    for b in range(B):
-        uniq, idx = torch.unique(kept[b], sorted=True, return_inverse=False, return_counts=False)
-        if uniq.numel() < K:
-            # fill missing by highest-strength non-selected
-            mask = torch.ones(T, dtype=torch.bool, device=device)
-            mask[uniq] = False
-            extra = torch.nonzero(mask, as_tuple=False).squeeze(1)
-            fill = extra[: (K - uniq.numel())]
-            kept[b, :uniq.numel()] = uniq
-            if fill.numel() > 0:
-                kept[b, uniq.numel():K] = fill
-        else:
-            kept[b] = uniq[:K]
-    return kept
+    # assign each token to nearest kept token
+    kept = torch.gather(phi, 1, keep.unsqueeze(-1).expand(-1, K, H))  # [B,K,H]
+    sim = torch.einsum("bih,bkh->bik", phi, kept)  # [B,T,K]
+    assign = sim.argmax(dim=2)                     # [B,T]
+    # force CLS token (position 0) to map to first kept
+    assign[:, 0] = 0
+    return keep, assign
 
 
-def _assign_to_nearest(phi: torch.Tensor, keep_idx: torch.Tensor) -> torch.Tensor:
-    # Assign every token to its nearest kept token in cosine distance.
-    # phi: [B,T,H], keep_idx: [B,K] -> assign_idx: [B,T]
+def select_hquota_ff(
+    phi: torch.Tensor,
+    K: int,
+    q: float = 0.30
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Head-quota(top-q by head-sum) + farthest-first selection with CLS protection.
+
+    Args:
+        phi: [B, T, H]  L2-normalized head-profile per token (b= batch, t=token, h=head)
+        K  : int, number of tokens to keep (>=1, <=T)
+        q  : fraction in [0,1], number of "seed" tokens taken by global head-sum (excl. CLS)
+
+    Returns:
+        keep_idx   : LongTensor [B, K] of absolute token indices to keep.
+                     Column 0 is always CLS (index 0).
+        assign_idx : LongTensor [B, T] for mapping each token to its assigned kept token index.
+    """
+    # ---- normalize features for cosine geometry (defensive) ----
+    phi = F.normalize(phi, dim=-1, eps=1e-6)  # [B,T,H]
     B, T, H = phi.shape
-    K = keep_idx.shape[1]
-    device = phi.device
-    # gather kept embeddings: [B,K,H]
-    kept_phi = torch.stack([phi[b, keep_idx[b]] for b in range(B)], dim=0)
-    # sim: [B,T,K]
-    sim = torch.matmul(phi, kept_phi.transpose(1, 2))
-    sim = torch.clamp(sim, -1.0, 1.0)
-    assign = torch.argmax(sim, dim=2)  # [B,T], indices in [0..K-1]
-    # map to kept token indices
-    mapped = torch.stack([keep_idx[b, assign[b]] for b in range(B)], dim=0)  # [B,T]
-    return mapped
+    K = int(max(1, min(K, T)))                # never exceed T, never be < 1
+    dev = phi.device
 
+    # allocate output container for kept absolute indices
+    keep = torch.zeros((B, K), dtype=torch.long, device=dev)
 
-@register_selector("hquota_ff")
-def select_hquota_ff(metric: torch.Tensor,
-                     size: torch.Tensor,
-                     r_block: int,
-                     q: float = 0.3,
-                     gamma: float = 0.0,
-                     cls_protect: bool = True,
-                     cand_extra: int = 128):
-    metric, size = _ensure_shapes(metric, size)          # metric: [B,H,T,D], size: [B,T]
-    B, H, T, D = metric.shape
-    K = max(0, T - int(r_block))
-    if K >= T or K <= 0:
-        # trivial: keep all or keep none (guard)
-        keep_idx = torch.arange(T, device=metric.device).unsqueeze(0).expand(B, T)
-        assign_idx = keep_idx.clone()
-        if K < T:
-            keep_idx = keep_idx[:, :K]
-            assign_idx = assign_idx[:, :K]  # not used when K==0
-        return keep_idx, assign_idx
+    # always keep CLS in column 0
+    keep[:, 0] = 0
 
-    # Build head-signature
-    phi = _head_signature(metric)                        # [B,T,H]
-    strength = _strength(phi, size, gamma)               # [B,T]
+    # nothing more to pick if K==1 or no non-CLS tokens
+    noncls = max(0, T - 1)
+    if K == 1 or noncls == 0:
+        # everyone maps to CLS column 0
+        assign_col = torch.zeros((B, T), dtype=torch.long, device=dev)
+        return keep, assign_col
 
-    # Seed pool (hub quota)
-    S = max(1, int(q * K))
-    # Always include CLS if protected
-    if cls_protect and T > 0:
-        # Ensure CLS is in seed set by boosting its score
-        strength = strength.clone()
-        strength[:, 0] = strength[:, 0] + 1e6
+    # ----- hub-quota seeds from non-CLS pool (indices 1..T-1) -----
+    # how many seeds from (K-1) slots, bounded by available non-CLS tokens
+    seed_cnt = min(noncls, max(0, int(q * K)))
+    # gather top 'seed_cnt' most dissimilar heads by global strength (sum over heads)
+    if seed_cnt > 0:
+        scores = phi[:, 1:, :].sum(dim=-1)  # [B, noncls]
+        _, top_rel = torch.topk(scores, k=seed_cnt, dim=1, largest=True, sorted=True)  # [B, seed_cnt]
+        keep[:, 1:1 + seed_cnt] = top_rel + 1  # +1 to shift back to absolute token indices
 
-    # top-S seeds per batch
-    topv, topi = torch.topk(strength, k=S, dim=1, largest=True, sorted=True)  # [B,S]
-    seeds = topi
+    # remaining slots to fill via farthest-first (diversity) among non-CLS tokens
+    rem = K - 1 - seed_cnt
+    if rem > 0:
+        # pairwise cosine similarity per batch: S[b] = phi_b @ phi_b^T, shape [T,T]
+        S = torch.bmm(phi, phi.transpose(1, 2))  # [B, T, T]
 
-    # Farthest-first to complete K
-    keep_idx = _farthest_first(phi, seeds, K, protect0=cls_protect)  # [B,K]
+        # for each batch, maintain a boolean mask of which token indices are already kept
+        taken = torch.zeros((B, T), dtype=torch.bool, device=dev)
+        taken[:, 0] = True  # CLS is always kept
+        if seed_cnt > 0:
+            # mark seeded columns as taken (shift by +1 for non-CLS indices)
+            cols = keep[:, 1:1 + seed_cnt]
+            # scatter True into taken mask at chosen columns per batch
+            # loop over batch for clarity/robustness
+            for b in range(B):
+                if cols.size(1) > 0:
+                    taken[b].scatter_(0, cols[b], True)
 
-    # Build assignment for all tokens to nearest kept
-    assign_idx = _assign_to_nearest(phi, keep_idx)       # [B,T]
+        next_col = 1 + seed_cnt  # next free column to write in `keep`
+        # Greedy farthest-first fill for remaining slots
+        for _ in range(rem):
+            # for each batch: compute "best(sim)" to current kept set for every token j
+            # best_sim[b, j] = max_{i in kept(b)} S[b, j, i]
+            best_sim = torch.full((B, T), float('-inf'), device=dev)
+            for b in range(B):
+                kept_cols = keep[b, :next_col]  # [next_col]
+                # similarity of all tokens (rows) to currently kept columns
+                sim_to_kept = S[b][:, kept_cols]                       # [T, next_col]
+                # best (max) similarity to any kept token
+                best = sim_to_kept.max(dim=1).values                   # [T]
+                # forbid reselecting already kept tokens
+                best = best.masked_fill(taken[b], float('inf'))
+                # pick token with smallest "best similarity" (i.e., farthest from current set)
+                nxt = torch.argmin(best).item()
+                keep[b, next_col] = int(nxt)
+                taken[b, nxt] = True
+            next_col += 1
+            if next_col >= K:  # safety guard
+                break
 
-    return keep_idx, assign_idx
+    # ----- Assign each token to nearest kept column (keep CLS self-mapping) -----
+    kept_phi = torch.gather(phi, 1, keep.unsqueeze(-1).expand(-1, K, H))  # [B,K,H]
+    sim = torch.einsum("bth,bkh->btk", phi, kept_phi)                      # [B,T,K]
+    # prevent non-CLS tokens from mapping to CLS column (index 0) if 원치 않으면 주석 처리
+    sim[:, 1:, 0] = -1e9
+    assign_col = sim.argmax(dim=2)                                         # [B,T]
+    assign_col[:, 0] = 0                                                   # CLS → column 0
+    # translate kept-column id → absolute token index
+    assign_idx = torch.stack([keep[b, assign_col[b]] for b in range(B)], dim=0)  # [B,T]
+
+    return keep, assign_idx
+
+def get_selector(name: str, q: float = 0.30) -> Callable[[torch.Tensor, int], Tuple[torch.Tensor, torch.Tensor]]:
+    name = (name or "hquota_ff").lower()
+    if name in ("hquota", "hquota_ff"):
+        return lambda phi, K: select_hquota_ff(phi, K, q)
+    if name in ("ff", "farthest_first"):
+        return _farthest_first
+    raise ValueError(f"Unknown selector: {name}")

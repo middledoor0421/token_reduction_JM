@@ -9,7 +9,7 @@ def apply_size_temperature(scale: torch.Tensor,
     """
     Adjust attention scale by token size.
     scale: scalar or tensor broadcastable to attention logits
-    size:  [B, K] merged sizes (or [B,T] if applied before merge)
+    size:  [B, K] merged sizes (or [B,T] if applied before merges)
     eta:   exponent; if 0, no-op
     Returns:
       adjusted scale (same shape as scale)

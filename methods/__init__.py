@@ -1,9 +1,11 @@
 # methods/__init__.py
-# Optional: from .schedule import parse_layers, feasible_r, r_for_block
+# Register plugins via side-effect imports (Python 3.9)
 
-# Register plugins via side-effects
-from .tome_adapter import plugin as _tome_plugin      # registers "tome"
+# identity baseline
 from .baselines.identity import plugin as _id_plugin  # registers "identity"
 
-# If you have our method plugin, keep it:
-# from .ours import plugin as _ours_plugin            # registers "ours"
+# ToMe adapter
+from .tome_adapter import plugin as _tome_plugin      # registers "tome"
+
+# Ours
+from .ours import *                                   # registers "ours"

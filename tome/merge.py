@@ -211,7 +211,7 @@ def merge_wavg(
     merge: Callable, x: torch.Tensor, size: torch.Tensor = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Applies the merge function by taking a weighted average based on token size.
+    Applies the merges function by taking a weighted average based on token size.
     Returns the merged tensor and the new token sizes.
     """
     if size is None:

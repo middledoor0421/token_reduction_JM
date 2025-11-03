@@ -339,7 +339,7 @@ class SwinTransformerBlock(nn.Module):
         # W-MSA/SW-MSA
         attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
 
-        # merge windows
+        # merges windows
         attn_windows = attn_windows.view(-1, self.window_size[0], self.window_size[1], C)
         shifted_x = window_reverse(attn_windows, self.window_size, self.input_resolution)  # B H' W' C
 

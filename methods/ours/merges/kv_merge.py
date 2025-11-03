@@ -1,5 +1,5 @@
 # methods/ours/merges/kv_merge.py
-# Minimal KV merge utilities (Python 3.9). Comments in English.
+# Minimal KV merges utilities (Python 3.9). Comments in English.
 
 from typing import Tuple, Optional
 import torch
@@ -102,7 +102,7 @@ def apply_pushlite(v_merged: torch.Tensor,
     """
     Apply light push correction on merged Value.
     v_merged:    [B,H,K,Hd] merged value
-    v_ref:       [B,H,K,Hd] reference delta source (e.g., pre-merge diff), or None to skip
+    v_ref:       [B,H,K,Hd] reference delta source (e.g., pre-merges diff), or None to skip
     alpha:       strength
     beta0:       base cap
     size_merged: [B,K] sizes for adaptive cap, or None (no adaptation)

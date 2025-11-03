@@ -429,7 +429,7 @@ class SwinTransformerBlock(nn.Module):
         # W-MSA/SW-MSA
         attn_windows = self.attn(x_windows, mask=self.attn_mask)  # num_windows * B, window_size * window_size, C
 
-        # merge windows
+        # merges windows
         attn_windows = attn_windows.view(-1, self.window_size[0], self.window_size[1], C)
         x = window_reverse(attn_windows, self.window_size, self.feat_size)  # B H' W' C
 
@@ -480,7 +480,7 @@ class PatchMerging(nn.Module):
         """
         B, C, H, W = x.shape
         # unfold + BCHW -> BHWC together
-        # ordering, 5, 3, 1 instead of 3, 5, 1 maintains compat with original swin v1 merge
+        # ordering, 5, 3, 1 instead of 3, 5, 1 maintains compat with original swin v1 merges
         x = x.reshape(B, C, H // 2, 2, W // 2, 2).permute(0, 2, 4, 5, 3, 1).flatten(3)
         x = self.norm(x)
         x = bhwc_to_bchw(self.reduction(x))

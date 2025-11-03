@@ -144,7 +144,7 @@ def parse_args():
     ap.add_argument("--gamma", type=float, default=0.0)  # ours
     ap.add_argument("--cand-extra", type=int, default=128, dest="cand_extra")  # ours
 
-    ap.add_argument("--merge", type=str, default="kv", choices=["kv", "v"])  # ours
+    ap.add_argument("--merges", type=str, default="kv", choices=["kv", "v"])  # ours
     ap.add_argument("--alpha", type=float, default=0.15)  # ours (push-lite)
     ap.add_argument("--beta0", type=float, default=0.5)  # ours
     ap.add_argument("--top-r", type=int, default=0)  # ours
@@ -198,8 +198,8 @@ def main():
             "hq_q": args.hq_q,
             "gamma": args.gamma,
             "cand_extra": args.cand_extra,
-            # merge/norm
-            "merge": args.merge,
+            # merges/norm
+            "merges": args.merges,
             "alpha": args.alpha,
             "beta0": args.beta0,
             "top_r": args.top_r,
@@ -209,15 +209,6 @@ def main():
             # schedule/logging
             "schedule": args.schedule,
             "log_coverage": bool(args.log_coverage),
-        })
-    if args.method == "ours":
-        plugin_cfg.update({
-            "selector": args.selector,
-            "hq_q": args.hq_q,
-            "gamma": args.gamma,
-            "cand_extra": args.cand_extra,
-            "drop": bool(args.drop),
-            "log_coverage": True
         })
 
     plugin = create_plugin(args.method, plugin_cfg)
