@@ -1,2 +1,4 @@
 # methods/tome_adapter/__init__.py
-from .plugin import TomePlugin  # ensures @register runs on import
+from .plugin import TomePlugin, apply_tome_with_hooks
+
+__all__ = ["TomePlugin", "apply_tome_with_hooks"]

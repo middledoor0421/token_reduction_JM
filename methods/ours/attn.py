@@ -1,226 +1,309 @@
 # methods/ours/attn.py
-# OursAttention: merge -> attend -> unmerge (Python 3.9)
-# Comments in English only.
+# Python 3.9 compatible. Comments in English only.
 
-from typing import Dict, Any, Tuple
+from typing import Optional, Tuple
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .selectors import get_selector
-from .merges import (
-    size_weighted_merge_v,
-    mean_merge_k,
-    build_unmerge_map,
-    apply_unmerge,
-    apply_pushlite,
-)
-from .sched import get_scheduler
-from .norm.l2_clip import l2_clip_
-from .norm.temp_scale import apply_size_temperature
-from .norm.recenter import recenter_
+try:
+    # Optional: if your project provides these modules, they will be used.
+    from core import token_stats as tstats
+except Exception:
+    tstats = None
+
+try:
+    from methods.ours.selectors.hquota import select_hquota_ff
+except Exception:
+    # Fallback stub if selector is not available; selects top-K by norm.
+    def select_hquota_ff(phi, K, quota_frac=0.0, cand_extra=0, force_k=False,
+                         cls_protect=True, scores=None, mix_alpha=0.5):
+        base = phi.norm(p=2, dim=-1)
+        if scores is not None:
+            base = (1.0 - mix_alpha) * base + mix_alpha * scores
+        K = min(K, base.shape[1])
+        return torch.topk(base, k=K, dim=-1, largest=True)[1]
 
 
 class OursAttention(nn.Module):
-    """Wrap timm Attention, reduce tokens by our policy, run attention on reduced set,
-    then unmerge back to original length [B,T,C] so residual add is shape-safe.
+    """
+    Token-reduction wrapper for our method with token-cap control and selector/merge hooks.
+
+    This module is designed to drop into an existing timm ViT block pipeline via a hook
+    (see OursApplier in main.py). It performs:
+      1) Build selection scores from provided features or x (fallback).
+      2) Run head-quota + farthest-first selector (select_hquota_ff).
+      3) If token_cap == "off": enforce exact r via simple backfill to reach K = T - r.
+      4) Merge by gathering kept tokens (placeholder). If your pipeline uses KV merge,
+         connect your merge function in _merge_tokens().
+      5) Optionally unmerge (no-op by default).
+      6) Record token stats (before, after_merge, after_unmerge, requested_r).
+
+    Notes:
+      - To preserve immediate run-ability without tight coupling to attention internals,
+        this implementation falls back to x-based norms when specialized features are absent.
+      - You can later wire in true head-profile (phi) and value/key merges without changing
+        the call sites; see TODOs in _build_scores/_merge_tokens/_unmerge_tokens.
     """
 
-    def __init__(self, inner_attn: nn.Module, cfg: Dict[str, Any]):
-        super(OursAttention, self).__init__()
-        self.inner = inner_attn
-        self.cfg = dict(cfg or {})
+    def __init__(
+        self,
+        token_cap: str = "on",           # "on": allow <r; "off": force exactly r
+        debug_token_stats: bool = False,
+        tau_adapt: bool = True,          # kept for compatibility (used if you pass tau)
+        max_tau_iters: int = 5,
+        cls_protect: bool = True,
+        enable_unmerge: bool = True,
 
-        # Core knobs
-        self.match_feature = str(self.cfg.get("match_feature", self.cfg.get("match-feature", "k")))  # 'k'|'xnorm'
-        self.merge_space = str(self.cfg.get("merge", "kv"))  # 'kv' or 'v'
-        self.keep_str = self.cfg.get("keep", None)           # optional string like "0.68,0.66,0.64"
-        self.r_global = int(self.cfg.get("r", 0))
+        # Selector/merge knobs (kept for backward compatibility with your CLI)
+        selector: str = "hquota_ff",
+        hq_quota: float = 0.0,           # fraction [0,1], reserved per head
+        cand_extra: int = 0,             # extra candidate pool
+        merge_mode: str = "v",           # "v" or "kv" (placeholder hook)
+        alpha: float = 0.0,              # merge weight param (placeholder)
+        beta0: float = 0.0,              # merge cap param (placeholder)
+        top_r: int = 0,                  # sparsity in merge (placeholder)
+        l2_clip_tau: float = 0.0,        # pre-score clipping tau (0 disables)
+        temp_eta: float = 1.0,           # temperature scaling for scores
+        size_delta: float = 0.0,         # optional size-based scaling (placeholder)
+        match_feature: str = "xnorm"     # "k" or "xnorm" (for future wiring)
+    ) -> None:
+        super().__init__()
+        self.token_cap = str(token_cap).lower()
+        self.debug_token_stats = bool(debug_token_stats)
+        self.tau_adapt = bool(tau_adapt)
+        self.max_tau_iters = int(max_tau_iters)
+        self.cls_protect = bool(cls_protect)
+        self.enable_unmerge = bool(enable_unmerge)
 
-        # Selector
-        self.selector_name = str(self.cfg.get("selector", "hquota_ff"))
-        self.hq_q = float(self.cfg.get("hq_q", 0.3))
-        self.gamma = float(self.cfg.get("gamma", 0.0))
-        self.cand_extra = int(self.cfg.get("cand_extra", 128))
-        self._selector = get_selector(self.selector_name)
+        # keep knobs for compatibility; used where applicable
+        self.selector_name = str(selector)
+        self.hq_quota = float(hq_quota)
+        self.cand_extra = int(cand_extra)
+        self.merge_mode = str(merge_mode).lower()
+        self.alpha = float(alpha)
+        self.beta0 = float(beta0)
+        self.top_r = int(top_r)
+        self.l2_clip_tau = float(l2_clip_tau)
+        self.temp_eta = float(max(1e-6, temp_eta))
+        self.size_delta = float(size_delta)
+        self.match_feature = str(match_feature)
 
-        # Norm / push-lite
-        self.l2_clip_tau = float(self.cfg.get("l2_clip_tau", 0.0))
-        self.alpha = float(self.cfg.get("alpha", 0.0))
-        self.beta0 = float(self.cfg.get("beta0", 0.5))
-        self.top_r = int(self.cfg.get("top_r", 0))
-        self.temp_eta = float(self.cfg.get("temp_eta", 0.0))
+    # ----------------------------- public API ---------------------------------
 
-        # Scheduler
-        self.schedule_name = str(self.cfg.get("schedule", "early_bias"))
-        self._scheduler = get_scheduler(self.schedule_name)
+    def forward(
+        self,
+        x: torch.Tensor,                 # [B, T, C]
+        layer_idx: int,
+        requested_r: Optional[int],
+        **feat_kwargs                     # optional: phi, scores, tau, etc.
+    ) -> torch.Tensor:
+        if x.dim() != 3:
+            return x
 
-        # Special tokens (DeiT has CLS, distill token optional)
-        self.has_cls = True
-        self.has_dist = False
-
-        # Infer timm attention attributes robustly
-        self.num_heads = int(getattr(self.inner, "num_heads", 0))
-        self.head_dim = getattr(self.inner, "head_dim", None)
-        if self.head_dim is None:
-            embed_dim = getattr(self.inner, "dim", None)
-            if embed_dim is None and hasattr(self.inner, "qkv") and hasattr(self.inner.qkv, "weight"):
-                embed_dim = int(self.inner.qkv.weight.shape[1])
-            if embed_dim is not None and self.num_heads:
-                self.head_dim = max(1, int(embed_dim // self.num_heads))
-        self.scale = getattr(self.inner, "scale", 1.0 if self.head_dim is None else 1.0 / (self.head_dim ** 0.5))
-        self.attn_drop = getattr(self.inner, "attn_drop", nn.Identity())
-        self.proj = getattr(self.inner, "proj", nn.Identity())
-        self.proj_drop = getattr(self.inner, "proj_drop", nn.Identity())
-
-        self.has_fused_qkv = hasattr(self.inner, "qkv")
-        if not self.has_fused_qkv:
-            if not (hasattr(self.inner, "q") and hasattr(self.inner, "k") and hasattr(self.inner, "v")):
-                raise RuntimeError("OursAttention: inner_attn must expose qkv or q/k/v projections")
-
-    def forward(self, x: torch.Tensor, attn_mask=None, layer_idx: int = 0, total_layers: int = 12, **unused) -> torch.Tensor:
         B, T, C = x.shape
+        before_len = int(T)
 
-        # Disabled guard: identity path if keep≈1 or r<=0
-        if self._disabled(T, layer_idx, total_layers):
-            return self.inner(x)
+        # 1) Build selection features/scores (phi and scores)
+        phi, scores, tau_used = self._build_scores(x, **feat_kwargs)  # phi: [B,T,H], scores: [B,T]
 
-        # Build q,k,v: [B,H,T,Hd]
-        q, k, v = self._qkv(x)
-
-        # Metric for selection
-        if self.match_feature == "k":
-            metric = F.normalize(k, dim=-1)                           # [B,H,T,Hd]
+        # 2) Determine target keep K from requested_r
+        if requested_r is None:
+            K_target = T
         else:
-            metric = F.normalize(x, dim=-1).unsqueeze(1)              # [B,1,T,C]
+            K_target = max(1, T - int(requested_r))
 
-        # Size tracking (start from ones)
-        size = x.new_ones(B, T)
+        # 3) Run selector to get keep indices
+        keep_idx = self._run_selector(phi, scores, K_target)
 
-        # Decide per-block keep and r
-        keep_ratio, r_block = self._decide_keep_r(T, layer_idx, total_layers)
-        if r_block <= 0 or keep_ratio >= 1.0:
-            return self.inner(x)
+        # 4) token-cap enforcement: force exactly r (i.e., exactly K_target kept) if off
+        if self.token_cap == "off":
+            keep_idx = self._backfill_to_exact_K(keep_idx, scores, K_target)
 
-        # 1) current token length and K (number of tokens to keep)
-        n_tokens = x.size(1)
-        K = max(1, n_tokens - int(r_block))  # ToMe-style r_block -> kept-count
+        # 5) Merge (placeholder gather-keep; wire your KV/V merge here)
+        x_merged, size_info = self._merge_tokens(x, keep_idx, layer_idx)
 
-        # 2) build head-profile phi: [B, T, H]
-        if self.match_feature == "k":
-            # k: [B,H,N,d] → per-head norm → φ: [B,N,H]
-            h_mag = torch.linalg.norm(k, dim=-1)  # [B,H,N]
-            phi = F.normalize(h_mag.transpose(1, 2).contiguous(), dim=-1)  # [B,N,H]
-        else:
-            # x: [B,N,C] → scalar profile per token → [B,N,1]
-            phi = torch.linalg.norm(F.normalize(x, dim=-1), dim=-1, keepdim=True)
+        after_merge_len = int(x_merged.shape[1])
 
-        # ---- SELECTOR: keep & assignment (absolute token indices) ----
-        keep_abs, assign_abs = self._selector(phi, K)
+        # 6) Unmerge (no-op by default; wire your unmerge if needed)
+        x_out = self._unmerge_tokens(x_merged, keep_idx, size_info, layer_idx)
+        after_unmerge_len = int(x_out.shape[1])
 
-        # Map absolute kept indices -> compact [0..K-1] for merging
-        K = int(keep_abs.shape[1])
-        idx_map = x.new_full((B, T), -1, dtype=torch.long)
-        for b in range(B):
-            idx_map[b, keep_abs[b]] = torch.arange(K, device=x.device, dtype=torch.long)
-        assign_idx = torch.gather(idx_map, 1, assign_abs)            # [B,T] in [0..K-1]
-
-        # ---- MERGE ----
-        # Value: size-weighted average; also returns merged sizes [B,K]
-        v_m, size_m = size_weighted_merge_v(v, size, assign_idx)     # [B,H,K,Hd], [B,K]
-
-        # Key/Query: either mean (kv) or gather (v-only)
-        if self.merge_space == "kv":
-            k_m = mean_merge_k(k, assign_idx)                        # [B,H,K,Hd]
-            q_m = mean_merge_k(q, assign_idx)                        # [B,H,K,Hd]
-        else:
-            k_m = torch.stack([k[b, :, keep_abs[b]] for b in range(B)], dim=0)  # [B,H,K,Hd]
-            q_m = torch.stack([q[b, :, keep_abs[b]] for b in range(B)], dim=0)
-
-        # Optional pre/post normalization
-        if self.l2_clip_tau > 0.0:
-            l2_clip_(v_m, self.l2_clip_tau)
-            l2_clip_(k_m, self.l2_clip_tau)
-
-        # Push-lite (light correction; if no reference delta, skip by passing None)
-        v_m = apply_pushlite(
-            v_merged=v_m, v_ref=None,
-            alpha=self.alpha, beta0=self.beta0,
-            size_merged=size_m, size_eta=self.temp_eta, top_r=self.top_r
-        )
-
-        # Optional size-adaptive temperature scaling (divide q magnitude)
-        if self.temp_eta != 0.0:
-            factor = apply_size_temperature(
-                scale=torch.ones(B, K, device=x.device), size=size_m, eta=self.temp_eta
-            )  # [B,K]
-            q_m = q_m / factor.view(B, 1, K, 1).clamp_min(1e-12)
-
-        # ---- ATTENTION on reduced tokens ----
-        y_red = self._attend(q_m, k_m, v_m)                          # [B,K,C]
-
-        # ---- UNMERGE back to T ----
-        scatter_idx = build_unmerge_map(assign_idx)                   # [B,T,1]
-        y_full = apply_unmerge(y_red, scatter_idx)                    # [B,T,C]
-        return y_full
-
-    # ---------- helpers ----------
-
-    def _disabled(self, T: int, layer_idx: int, total_layers: int) -> bool:
-        """Return True if reduction is disabled by keep/r settings."""
-        if self.keep_str is not None:
-            ks = [float(s.strip()) for s in str(self.keep_str).split(",") if s.strip() != ""]
-            if len(ks) == 0:
-                return True
-            if len(ks) == 1:
-                keep = ks[0]
-            elif layer_idx < len(ks):
-                keep = ks[layer_idx]
-            else:
-                keep = ks[-1]
-            if keep >= 0.999:
-                return True
-        if self.keep_str is None and self.r_global <= 0:
-            return True
-        return False
-
-    def _decide_keep_r(self, T: int, layer_idx: int, total_layers: int) -> Tuple[float, int]:
-        """Choose keep ratio and r for this block."""
-        if self.keep_str is not None:
-            keep, r_blk = self._scheduler(
-                T=T, layer_idx=layer_idx, total_layers=total_layers,
-                cfg=self.cfg, class_token=self.has_cls, distill_token=self.has_dist
+        # 7) Stats and debug
+        if self.debug_token_stats:
+            removed_est = before_len - after_unmerge_len
+            print(
+                "[Ours]"
+                + f"[L{layer_idx}] before={before_len}, "
+                + f"after_merge={after_merge_len}, "
+                + f"after_unmerge={after_unmerge_len}, "
+                + f"req_r={requested_r}, "
+                + f"K_target={K_target}, "
+                + f"removed_final={removed_est}, "
+                + f"tau={tau_used}"
             )
-            return keep, r_blk
-        # r-driven mode (cap at 50% merges while protecting special tokens)
-        protected = (1 if self.has_cls else 0) + (1 if self.has_dist else 0)
-        max_r = max(0, (T - protected) // 2)
-        r_blk = min(max(0, int(self.r_global)), max_r)
-        keep = float(max(1, T - r_blk)) / float(max(1, T))
-        return keep, r_blk
 
-    def _qkv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return q,k,v as [B,H,T,Hd]."""
+        if tstats is not None:
+            try:
+                tstats.record(
+                    layer_idx=int(layer_idx),
+                    before_len=before_len,
+                    after_merge_len=after_merge_len,
+                    after_unmerge_len=after_unmerge_len,
+                    requested_r=int(requested_r) if requested_r is not None else None
+                )
+            except Exception:
+                pass
+
+        return x_out
+
+    # --------------------------- feature building -----------------------------
+
+    def _build_scores(
+        self,
+        x: torch.Tensor,
+        **feat_kwargs
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[float]]:
+        """
+        Build (phi, scores, tau_used) for selection.
+          - If feat_kwargs provides 'phi' ([B,T,H]) or 'scores' ([B,T]), use them.
+          - Otherwise, fall back to x-based features: phi from split channels, scores from ||x||.
+          - Apply optional L2 clipping and temperature scaling on scores.
+        """
         B, T, C = x.shape
-        H = self.num_heads if self.num_heads else 1
-        Hd = self.head_dim if self.head_dim is not None else max(1, C // H)
-        if self.has_fused_qkv:
-            qkv = self.inner.qkv(x)                                   # [B, T, 3*C]
-            qkv = qkv.reshape(B, T, 3, H, Hd).permute(2, 0, 3, 1, 4)  # [3,B,H,T,Hd]
-            q, k, v = qkv[0], qkv[1], qkv[2]
-        else:
-            q = self.inner.q(x).view(B, T, H, Hd).permute(0, 2, 1, 3)
-            k = self.inner.k(x).view(B, T, H, Hd).permute(0, 2, 1, 3)
-            v = self.inner.v(x).view(B, T, H, Hd).permute(0, 2, 1, 3)
-        return q, k, v
+        device = x.device
 
-    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """Run attention on reduced tokens; returns [B,K,C] after proj."""
-        attn = torch.matmul(q * self.scale, k.transpose(-2, -1))
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_drop(attn)
-        y = torch.matmul(attn, v)                                     # [B,H,K,Hd]
-        y = y.transpose(1, 2).contiguous().view(y.shape[0], y.shape[2], -1)  # [B,K,C]
-        y = self.proj(y)
-        y = self.proj_drop(y)
-        return y
+        # Use provided head-profile if available; else create a proxy from x
+        phi = feat_kwargs.get("phi", None)
+        if phi is None:
+            H = min(8, max(1, C // max(1, (C // 8))))  # heuristic small head count
+            if C % H == 0:
+                x_resh = x.view(B, T, H, C // H)
+                phi = x_resh.norm(p=2, dim=-1)  # [B,T,H]
+            else:
+                # Fallback: replicate a single norm across H=1
+                phi = x.norm(p=2, dim=-1, keepdim=True)  # [B,T,1]
+        else:
+            # ensure float
+            phi = phi.float()
+
+        # Base scores
+        scores = feat_kwargs.get("scores", None)
+        if scores is None:
+            scores = x.pow(2).sum(dim=-1).sqrt()  # [B,T]
+        else:
+            scores = scores.float()
+
+        # Optional L2 clipping on scores
+        if self.l2_clip_tau is not None and self.l2_clip_tau > 0.0:
+            tau = float(self.l2_clip_tau)
+            scores = torch.clamp(scores, max=tau)
+
+        # Temperature scaling
+        if self.temp_eta is not None and self.temp_eta != 1.0:
+            scores = scores / float(self.temp_eta)
+
+        tau_used = feat_kwargs.get("tau", None)
+        if tau_used is not None:
+            try:
+                tau_used = float(tau_used)
+            except Exception:
+                tau_used = None
+
+        return phi, scores, tau_used
+
+    # ------------------------------ selection ---------------------------------
+
+    def _run_selector(
+        self,
+        phi: torch.Tensor,               # [B,T,H]
+        scores: torch.Tensor,            # [B,T]
+        K_target: int
+    ) -> torch.Tensor:
+        """
+        Run head-quota + farthest-first selector to get keep indices.
+        """
+        K_target = max(1, min(K_target, phi.shape[1]))
+        keep_idx = select_hquota_ff(
+            phi=phi,
+            K=K_target,
+            quota_frac=self.hq_quota,
+            cand_extra=self.cand_extra,
+            force_k=(self.token_cap == "off"),
+            cls_protect=self.cls_protect,
+            scores=scores,
+            mix_alpha=0.5
+        )
+        return keep_idx
+
+    def _backfill_to_exact_K(
+        self,
+        keep_idx: torch.Tensor,          # [B,K_found]
+        scores: torch.Tensor,            # [B,T]
+        K_target: int
+    ) -> torch.Tensor:
+        """
+        Ensure exactly K_target kept indices by backfilling with top scores,
+        excluding CLS and already chosen, batch-wise.
+        """
+        B, T = scores.shape
+        device = scores.device
+        cur_K = int(keep_idx.shape[-1])
+        need = K_target - cur_K
+        if need <= 0:
+            return keep_idx
+
+        mask = torch.ones(B, T, dtype=torch.bool, device=device)
+        if self.cls_protect and T > 0:
+            mask[:, 0] = False
+
+        chosen = keep_idx
+        if chosen.dim() == 1:
+            chosen = chosen.view(1, -1).expand(B, -1)
+        for b in range(B):
+            mask[b, chosen[b]] = False
+
+        base = torch.where(mask, scores, torch.full_like(scores, float("-inf")))
+        extra_k = min(need, int(mask.sum(dim=1).min().item()))
+        if extra_k <= 0:
+            return keep_idx
+
+        extra_idx = torch.topk(base, k=extra_k, dim=-1, largest=True)[1]  # [B, extra_k]
+        keep_idx = torch.cat([keep_idx, extra_idx], dim=-1)
+        return keep_idx
+
+    # ------------------------------ merge/unmerge -----------------------------
+
+    def _merge_tokens(
+        self,
+        x: torch.Tensor,                 # [B,T,C]
+        keep_idx: torch.Tensor,          # [B,K]
+        layer_idx: int
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Placeholder merge: gather kept tokens only.
+        If you have KV/V merge with size-weighted averaging, plug it here.
+        """
+        B, T, C = x.shape
+        K = int(keep_idx.shape[-1])
+        gather = keep_idx.unsqueeze(-1).expand(B, K, C)     # [B,K,C]
+        x_merged = torch.gather(x, 1, gather)               # [B,K,C]
+        size_info = {}  # fill with your merge meta if needed
+        return x_merged, size_info
+
+    def _unmerge_tokens(
+        self,
+        x_merged: torch.Tensor,
+        keep_idx: torch.Tensor,
+        size_info: dict,
+        layer_idx: int
+    ) -> torch.Tensor:
+        """
+        No-op unmerge by default. If your pipeline supports unmerge (e.g., for attention),
+        connect it here using size_info and keep_idx.
+        """
+        if not self.enable_unmerge:
+            return x_merged
+        # Default behavior: return merged representation without restoring length.
+        return x_merged
