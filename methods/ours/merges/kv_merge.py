@@ -1,132 +1,154 @@
 # methods/ours/merges/kv_merge.py
-# Minimal KV merges utilities (Python 3.9). Comments in English.
+# Python 3.9 compatible. Comments in English only.
 
-from typing import Tuple, Optional
+from typing import Tuple, Dict, Any, Optional
 import torch
-import torch.nn.functional as F
 
 
-def size_weighted_merge_v(v: torch.Tensor,
-                          size: torch.Tensor,
-                          assign_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+@torch.no_grad()
+def size_weighted_merge_v(
+    x: torch.Tensor,                 # [B, T, C]
+    keep_idx: torch.Tensor,          # [B, K] indices of kept centers
+    assign_idx: torch.Tensor,        # [B, T] cluster id in [0..K-1] for each token
+    alpha: float = 0.0,              # center bias: out = (1-alpha)*mean + alpha*center_vec
+    size_delta: float = 0.0          # reserved (hook for custom size weighting)
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
-    Merge Value by size-weighted average.
-    Args:
-      v:    [B, H, T, Hd]
-      size: [B, T]
-      assign_idx: [B, T] mapping each token -> kept token index in [0..K-1]
+    Merge tokens in V-space by size-weighted averaging per cluster.
+    Ensures each center maps to itself (assumed by caller).
+
     Returns:
-      v_merged: [B, H, K, Hd]
-      size_merged: [B, K]
+      x_merged: [B, K, C]
+      info: {"assign_idx":[B,T], "keep_idx":[B,K], "sizes":[B,K]}
     """
-    B, H, T, Hd = v.shape
-    K = int(assign_idx.max().item()) + 1
-    device = v.device
-    # Expand size to match v for weighted sum
-    s = size.view(B, 1, T, 1)  # [B,1,T,1]
-    v_w = v * s                # [B,H,T,Hd]
+    assert x.dim() == 3, "x must be [B,T,C]"
+    B, T, C = int(x.size(0)), int(x.size(1)), int(x.size(2))
+    K = int(keep_idx.size(1))
+    device = x.device
+    dtype = x.dtype
 
-    # Build one-hot assignment: [B,T,K]
-    one_hot = torch.zeros(B, T, K, device=device, dtype=v.dtype)
-    one_hot.scatter_(dim=2, index=assign_idx.unsqueeze(2), value=1.0)  # [B,T,K]
+    if K == 0 or T == 0:
+        return x, {"assign_idx": assign_idx, "keep_idx": keep_idx, "sizes": torch.zeros((B, 0), dtype=dtype, device=device)}
 
-    # Sum per kept group
-    # v_sum: [B,H,K,Hd] = (B,H,T,Hd) x (B,T,K) along T
-    v_sum = torch.einsum("bhtd,btk->bhkd", v_w, one_hot)
-    s_sum = torch.einsum("btk,bt->bk", one_hot, size)  # [B,K]
+    out = torch.zeros((B, K, C), dtype=dtype, device=device)
+    sizes = torch.zeros((B, K), dtype=dtype, device=device)
 
-    # Avoid division by zero
-    eps = 1e-12
-    v_merged = v_sum / (s_sum.view(B, 1, K, 1).clamp_min(eps))
-    return v_merged, s_sum
+    one_vec = torch.ones((T,), dtype=dtype, device=device)
+
+    for b in range(B):
+        idx = assign_idx[b]  # [T] -> cluster id in [0..K-1]
+
+        # Sum values per cluster (scatter-add along cluster axis)
+        out_b = out[b]                    # [K,C]
+        sizes_b = sizes[b]                # [K]
+        out_b.index_add_(0, idx, x[b])   # sum of vectors
+        sizes_b.index_add_(0, idx, one_vec)
+
+        # Mean per cluster
+        denom = sizes_b.clamp_min(1.0).unsqueeze(-1)  # [K,1]
+        mean_b = out_b / denom                        # [K,C]
+
+        # Optional center bias blending
+        if alpha != 0.0:
+            centers_b = x[b, keep_idx[b]]            # [K,C]
+            out[b] = (1.0 - float(alpha)) * mean_b + float(alpha) * centers_b
+        else:
+            out[b] = mean_b
+
+        # (reserved) custom size weighting via size_delta could be inserted here
+
+    info: Dict[str, Any] = {
+        "assign_idx": assign_idx,
+        "keep_idx": keep_idx,
+        "sizes": sizes
+    }
+    return out, info
 
 
-def mean_merge_k(k: torch.Tensor,
-                 assign_idx: torch.Tensor) -> torch.Tensor:
+@torch.no_grad()
+def size_weighted_merge_kv(
+    k: torch.Tensor,                 # [B, T, Ck]
+    v: torch.Tensor,                 # [B, T, Cv]
+    keep_idx: torch.Tensor,          # [B, K]
+    assign_idx: torch.Tensor,        # [B, T] in [0..K-1]
+    alpha: float = 0.0,
+    size_delta: float = 0.0
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
     """
-    Merge Key by simple mean per kept group.
-    Args:
-      k: [B, H, T, Hd]
-      assign_idx: [B, T] in [0..K-1]
+    Merge keys and values jointly (mean per cluster, optional center bias).
     Returns:
-      k_merged: [B, H, K, Hd]
+      k_merged: [B, K, Ck], v_merged: [B, K, Cv], info: {..., "sizes":[B,K]}
     """
-    B, H, T, Hd = k.shape
-    K = int(assign_idx.max().item()) + 1
+    assert k.dim() == 3 and v.dim() == 3, "k,v must be [B,T,C]"
+    B, T, Ck = int(k.size(0)), int(k.size(1)), int(k.size(2))
+    _, _, Cv = v.size()
+    K = int(keep_idx.size(1))
     device = k.device
+    dtype_k = k.dtype
+    dtype_v = v.dtype
 
-    one_hot = torch.zeros(B, T, K, device=device, dtype=k.dtype)
-    one_hot.scatter_(dim=2, index=assign_idx.unsqueeze(2), value=1.0)  # [B,T,K]
+    if K == 0 or T == 0:
+        info = {"assign_idx": assign_idx, "keep_idx": keep_idx, "sizes": torch.zeros((B, 0), dtype=k.dtype, device=device)}
+        return k, v, info
 
-    k_sum = torch.einsum("bhtd,btk->bhkd", k, one_hot)  # [B,H,K,Hd]
-    cnt = one_hot.sum(dim=1).clamp_min(1.0)            # [B,K]
-    k_merged = k_sum / cnt.view(B, 1, K, 1)
-    return k_merged
+    k_out = torch.zeros((B, K, Ck), dtype=dtype_k, device=device)
+    v_out = torch.zeros((B, K, Cv), dtype=dtype_v, device=device)
+    sizes = torch.zeros((B, K), dtype=dtype_k, device=device)
+
+    one_vec_k = torch.ones((T,), dtype=dtype_k, device=device)
+    one_vec_v = torch.ones((T,), dtype=dtype_v, device=device)
+
+    for b in range(B):
+        idx = assign_idx[b]
+
+        # scatter-add for keys
+        k_out_b = k_out[b]
+        sizes_b = sizes[b]
+        k_out_b.index_add_(0, idx, k[b])
+        sizes_b.index_add_(0, idx, one_vec_k)
+
+        # scatter-add for values
+        v_out_b = v_out[b]
+        v_out_b.index_add_(0, idx, v[b])
+
+        denom = sizes_b.clamp_min(1.0).unsqueeze(-1)
+        k_mean = k_out_b / denom
+        v_mean = v_out_b / denom
+
+        if alpha != 0.0:
+            centers_k = k[b, keep_idx[b]]
+            centers_v = v[b, keep_idx[b]]
+            k_out[b] = (1.0 - float(alpha)) * k_mean + float(alpha) * centers_k
+            v_out[b] = (1.0 - float(alpha)) * v_mean + float(alpha) * centers_v
+        else:
+            k_out[b] = k_mean
+            v_out[b] = v_mean
+
+        # (reserved) insert size_delta weighting if needed
+
+    info = {"assign_idx": assign_idx, "keep_idx": keep_idx, "sizes": sizes}
+    return k_out, v_out, info
 
 
-def build_unmerge_map(assign_idx: torch.Tensor) -> torch.Tensor:
+@torch.no_grad()
+def apply_unmerge(
+    x_merged: torch.Tensor,           # [B, K, C]
+    keep_idx: torch.Tensor,           # [B, K]
+    assign_idx: torch.Tensor,         # [B, T] cluster id in [0..K-1]
+    info: Optional[Dict[str, Any]] = None
+) -> torch.Tensor:
     """
-    Build unmerge scatter indices mapping reduced -> full length.
-    Args:
-      assign_idx: [B, T] values in [0..K-1] (kept representative per original token)
-    Returns:
-      scatter_idx: [B, T, 1] indices into reduced axis (K) for gathering/scattering.
+    Unmerge by broadcasting cluster representatives back to original positions.
+    Simple nearest-center "unpool": x_out[b, t] = x_merged[b, assign_idx[b, t]].
     """
-    return assign_idx.unsqueeze(-1)  # [B,T,1]
+    assert x_merged.dim() == 3, "x_merged must be [B,K,C]"
+    B, K, C = int(x_merged.size(0)), int(x_merged.size(1)), int(x_merged.size(2))
+    T = int(assign_idx.size(1))
+    device = x_merged.device
+    dtype = x_merged.dtype
 
-
-def apply_unmerge(y_reduced: torch.Tensor,
-                  scatter_idx: torch.Tensor) -> torch.Tensor:
-    """
-    Expand reduced tokens back to length T using scatter indices.
-    Args:
-      y_reduced:  [B, T', C] where T' == K
-      scatter_idx:[B, T, 1] with values in [0..K-1]
-    Returns:
-      y_full:     [B, T, C]
-    """
-    B, K, C = y_reduced.shape
-    T = scatter_idx.shape[1]
-    # Gather along K -> T
-    y_full = torch.gather(y_reduced, dim=1, index=scatter_idx.expand(B, T, C))
-    return y_full
-
-
-def apply_pushlite(v_merged: torch.Tensor,
-                   v_ref: Optional[torch.Tensor],
-                   alpha: float,
-                   beta0: float,
-                   size_merged: Optional[torch.Tensor] = None,
-                   size_eta: float = 0.0,
-                   top_r: int = 0) -> torch.Tensor:
-    """
-    Apply light push correction on merged Value.
-    v_merged:    [B,H,K,Hd] merged value
-    v_ref:       [B,H,K,Hd] reference delta source (e.g., pre-merges diff), or None to skip
-    alpha:       strength
-    beta0:       base cap
-    size_merged: [B,K] sizes for adaptive cap, or None (no adaptation)
-    size_eta:    exponent for size adaptation (beta = beta0 * (size/mean)^eta)
-    top_r:       apply only to top-r channels per token by magnitude (0 disables sparsity)
-    """
-    if v_ref is None or alpha == 0.0:
-        return v_merged
-    B, H, K, Hd = v_ref.shape
-    if size_merged is not None and size_eta != 0.0:
-        mean_s = size_merged.mean(dim=1, keepdim=True)  # [B,1]
-        adapt = (size_merged / mean_s.clamp_min(1e-12)).pow(size_eta)  # [B,K]
-        beta = beta0 * adapt  # [B,K]
-        beta = beta.view(B, 1, K, 1)
-    else:
-        beta = v_ref.new_full((B, 1, K, 1), float(beta0))
-
-    delta = torch.clamp(v_ref, min=-1.0, max=1.0)  # basic safe bound
-    if top_r and top_r > 0 and top_r < Hd:
-        # keep only top-r channels per token by |delta|
-        mag = delta.abs()                            # [B,H,K,Hd]
-        kth = torch.kthvalue(mag, k=Hd - top_r + 1, dim=-1).values  # [B,H,K]
-        mask = (mag >= kth.unsqueeze(-1)).to(delta.dtype)           # [B,H,K,Hd]
-        delta = delta * mask
-
-    v_corr = v_merged + alpha * torch.clamp(delta, min=-beta, max=beta)
-    return v_corr
+    x_out = torch.zeros((B, T, C), dtype=dtype, device=device)
+    for b in range(B):
+        idx = assign_idx[b]                     # [T]
+        x_out[b] = x_merged[b].index_select(0, idx)  # gather per original position
+    return x_out
