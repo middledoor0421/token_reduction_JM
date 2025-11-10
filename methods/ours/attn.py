@@ -1,373 +1,272 @@
 # methods/ours/attn.py
 # Python 3.9 compatible. Comments in English only.
 
-from typing import Optional, Tuple, List, Callable
+from typing import Optional, Tuple, List, Dict, Any, Callable
+import time
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ----------------------------- project deps ----------------------------------
-
+# ---- external deps (safe imports) -------------------------------------------
 try:
     from core import token_stats as tstats
 except Exception:
     tstats = None
 
-# Selector (O-2)
-from .selectors.hquota_ff import select_hquota_ff
-
-# Merge backends (O-3)
 try:
-    from .merges.kv_merge import size_weighted_merge_v as ext_size_weighted_merge_v  # type: ignore
-    from .merges.kv_merge import size_weighted_merge_kv as ext_size_weighted_merge_kv  # type: ignore
-    from .merges.kv_merge import apply_unmerge as ext_apply_unmerge  # type: ignore
+    from core.measure import BlockMeter
+except Exception:
+    BlockMeter = None  # meter will be optional
 
+try:
+    # Selector (drop-r + vectorized head-quota)
+    from .selectors.hquota import select_hquota_ff
+except Exception:
+    def select_hquota_ff(phi, K, quota_frac=0.0, cand_extra=0, force_k=False,
+                         cls_protect=True, scores=None, mix_alpha=0.5,
+                         select_mode="keep"):
+        base = phi.norm(p=2, dim=-1)
+        if scores is not None:
+            base = 0.5 * base + 0.5 * scores
+        topk = min(K, base.shape[1])
+        return torch.topk(base, k=topk, dim=-1, largest=True)[1]
+
+try:
+    # Merges
+    from .merges.kv_merge import size_weighted_merge_v, size_weighted_merge_kv, apply_unmerge
     _HAS_EXT_MERGE = True
 except Exception:
     _HAS_EXT_MERGE = False
+    def size_weighted_merge_v(x, keep_idx, assign_idx, alpha=0.0, size_delta=0.0):
+        # Fallback: simple mean merge
+        B, T, C = x.shape
+        K = int(keep_idx.shape[1])
+        out = x.new_zeros((B, K, C))
+        sizes = x.new_zeros((B, K))
+        for b in range(B):
+            idx = assign_idx[b]
+            out_b = out[b]
+            sizes_b = sizes[b]
+            out_b.index_add_(0, idx, x[b])
+            sizes_b.index_add_(0, idx, torch.ones(T, dtype=x.dtype, device=x.device))
+            out[b] = out_b / sizes_b.clamp_min(1.0).unsqueeze(-1)
+        info = {"assign_idx": assign_idx, "keep_idx": keep_idx, "sizes": sizes}
+        return out, info
+    def apply_unmerge(x_merged, keep_idx, assign_idx, info=None):
+        return x_merged
 
 
-# ----------------------------- OursAttention ---------------------------------
+# ============================ Ours core (reducer) ============================
 
 class OursAttention(nn.Module):
     """
-    Ours token reduction (training-free).
-    Designed to be called BETWEEN Attention and MLP (in-block).
+    Ours reduction stage to be applied between Attention and MLP (in-block).
+    Training-free; supports token-cap semantics and per-layer r schedule.
     """
 
     def __init__(
-            self,
-            token_cap: str = "on",  # "on": allow <r; "off": force exactly r
-            debug_token_stats: bool = False,
-            tau_adapt: bool = True,  # reserved for future threshold relaxation
-            enable_unmerge: bool = False,  # keep False for in-block mode (O-1)
-            # selector knobs
-            selector: str = "hquota_ff",
-            hq_quota: float = 0.0,
-            cand_extra: int = 0,
-            # merge knobs
-            merge_mode: str = "v",  # "v" or "kv" (kv requires keys/values)
-            alpha: float = 0.0,  # center bias: out=(1-alpha)*mean+alpha*center
-            beta0: float = 0.0,  # reserved
-            top_r: int = 0,  # reserved
-            l2_clip_tau: float = 0.0,
-            temp_eta: float = 1.0,
-            size_delta: float = 0.0,  # reserved for custom size weighting
-            match_feature: str = "xnorm"  # "xnorm" (default) or "k" if keys are passed as phi
+        self,
+        *,
+        token_cap: str = "on",              # "on": allow <r; "off": force exactly r
+        debug_token_stats: bool = False,
+        tau_adapt: bool = True,             # reserved for advanced selectors
+        quota_frac: float = 0.30,
+        cand_extra: int = 16,
+        merge_mode: str = "v",              # "v" or "kv"
+        alpha: float = 0.15,
+        size_delta: float = 0.0,
+        select_mode: str = "keep"           # "keep" or "drop"
     ) -> None:
         super().__init__()
         self.token_cap = str(token_cap).lower()
-        self.debug_token_stats = bool(debug_token_stats)
+        self.debug = bool(debug_token_stats)
         self.tau_adapt = bool(tau_adapt)
-        self.enable_unmerge = bool(enable_unmerge)
-
-        self.selector = str(selector)
-        self.hq_quota = float(hq_quota)
+        self.quota_frac = float(quota_frac)
         self.cand_extra = int(cand_extra)
-
         self.merge_mode = str(merge_mode).lower()
         self.alpha = float(alpha)
-        self.beta0 = float(beta0)
-        self.top_r = int(top_r)
-        self.l2_clip_tau = float(l2_clip_tau)
-        self.temp_eta = float(temp_eta)
         self.size_delta = float(size_delta)
-        self.match_feature = str(match_feature)
-
+        self.select_mode = "drop" if str(select_mode).lower() == "drop" else "keep"
         # Always preserve CLS
         self.cls_protect = True
 
-        # Cache last log-sizes for proportional attention (O-4)
-        self.last_log_sizes = None  # type: Optional[torch.Tensor]
+    # ---- assignment by cosine ------------------------------------------------
+    def _build_assignment(self, feat: torch.Tensor, keep_idx: torch.Tensor) -> torch.Tensor:
+        """
+        Map each token to nearest kept center (cosine). feat: [B,T,H], keep_idx: [B,K] (long).
+        Returns assign_idx: [B,T] with values in [0..K-1].
+        """
+        B, T, H = feat.shape
+        K = keep_idx.shape[1]
+        device = feat.device
+        # Gather kept features
+        gather_idx = keep_idx.unsqueeze(-1).expand(B, K, H)              # [B,K,H]
+        kept_feat = torch.gather(feat, 1, gather_idx)                     # [B,K,H]
+        feat_n = F.normalize(feat, dim=-1)                                # [B,T,H]
+        kept_n = F.normalize(kept_feat, dim=-1)                           # [B,K,H]
+        # Similarity [B,T,K]
+        sim = torch.einsum("bth,bkh->btk", feat_n, kept_n)
+        assign_idx = torch.argmax(sim, dim=-1)                            # [B,T]
+        # ensure centers map to themselves
+        for b in range(B):
+            for k in range(K):
+                center_tok = int(keep_idx[b, k].item())
+                if 0 <= center_tok < T:
+                    assign_idx[b, center_tok] = k
+        return assign_idx
 
-    # ---- public API ----
-
+    # ---- forward -------------------------------------------------------------
     def forward(
-            self,
-            x: torch.Tensor,  # [B, T, C]  (post-Attention, pre-MLP)
-            *,
-            layer_idx: int,
-            requested_r: Optional[int],
-            phi: Optional[torch.Tensor] = None,  # [B, T, H] optional features (e.g., keys)
-            scores: Optional[torch.Tensor] = None,  # [B, T] optional strength
-            return_info: bool = False
-    ):
-        if x.dim() != 3:
-            return (x, {}) if return_info else x
-        B, T, C = int(x.size(0)), int(x.size(1)), int(x.size(2))
-        before_len = T
+        self,
+        x: torch.Tensor,                    # [B, T, C] (post-Attention)
+        *,
+        layer_idx: int,
+        requested_r: Optional[int],
+        scores: Optional[torch.Tensor] = None,   # optional external strength [B,T]
+        enable_unmerge: bool = False,
+        meter: Optional["BlockMeter"] = None
+    ) -> torch.Tensor:
+        B, T, C = x.shape
+        t_pre = T
+        t0 = time.perf_counter()
 
-        # 1) Build selection features and base scores
-        feat, base_scores = self._build_features(x, phi, scores)  # feat: [B,T,Hf], base_scores: [B,T]
+        # Base scores (fallback)
+        if scores is None:
+            scores = x.pow(2).sum(dim=-1)  # [B,T]
 
-        # 2) Determine target keep count
-        if requested_r is None:
-            K = T
+        # Feature for selection/assignment (unit-normalized)
+        feat = F.normalize(x, dim=-1)      # [B,T,C] treated as [B,T,H]
+
+        # Target K from requested_r
+        if isinstance(requested_r, int) and requested_r > 0:
+            K_target = max(1, T - int(requested_r))
         else:
-            K = max(1, T - int(requested_r))
+            K_target = T  # no reduction on this layer
 
-        # 3) Select keep indices (CLS reserved, token-cap respected)
-        force_exact = (self.token_cap == "off")
-        if self.selector != "hquota_ff":
-            # fallback: use hquota_ff anyway
-            pass
-
+        # Select kept indices
         keep_idx = select_hquota_ff(
             phi=feat,
-            K=K,
-            quota_frac=self.hq_quota,
-            cand_extra=max(0, self.cand_extra),
-            force_k=force_exact,
+            K=K_target,
+            quota_frac=self.quota_frac,
+            cand_extra=self.cand_extra,
+            force_k=(self.token_cap == "off"),
             cls_protect=True,
-            scores=base_scores,
-            mix_alpha=0.5
-        )  # [B, K_eff]
-        K_found = int(keep_idx.size(1)) if keep_idx.numel() > 0 else 0
-        if K_found == 0:
-            # Should not happen, but be safe
-            keep_idx = torch.zeros((B, 1), dtype=torch.long, device=x.device)
-            K_found = 1
+            scores=scores,
+            mix_alpha=0.5,
+            select_mode=self.select_mode
+        )  # [B,K_eff]
+        if keep_idx.ndim != 2:
+            keep_idx = keep_idx.view(B, -1)
+        K_found = int(keep_idx.shape[1])
 
-        # 4) Build assignment of all tokens to nearest kept center (cosine)
-        assign_idx = self._build_assignment(feat, keep_idx)  # [B, T] in [0..K_found-1]
+        # Assign each token to nearest kept token
+        assign_idx = self._build_assignment(feat, keep_idx)  # [B,T]
 
-        # 5) Merge tokens (V-merge by default, size-weighted backend if available)
-        if K_found == T:
-            x_merged = x
-            size_info = {"assign_idx": assign_idx, "keep_idx": keep_idx, "sizes": x.new_full((B, T), 1.0)}
+        # Merge (V-merge default; KV when external keys available and requested)
+        if self.merge_mode == "kv":
+            # No key/value tensors wired here; fall back to V-merge for safety
+            x_merged, size_info = size_weighted_merge_v(
+                x=x, keep_idx=keep_idx, assign_idx=assign_idx, alpha=self.alpha, size_delta=self.size_delta
+            )
         else:
-            if _HAS_EXT_MERGE and self.merge_mode == "v":
-                try:
-                    x_merged, size_info = ext_size_weighted_merge_v(
-                        x=x, keep_idx=keep_idx, assign_idx=assign_idx,
-                        alpha=self.alpha, size_delta=self.size_delta
-                    )
-                except Exception:
-                    x_merged, size_info = self._merge_v_mean(x, keep_idx, assign_idx)
-            elif _HAS_EXT_MERGE and self.merge_mode == "kv" and phi is not None:
-                # If keys (phi) are provided and a KV merge is desired, you could pass
-                # keys=phi and values=x here. Otherwise fall back to V-merge.
-                try:
-                    k_merged, v_merged, size_info = ext_size_weighted_merge_kv(
-                        k=phi, v=x, keep_idx=keep_idx, assign_idx=assign_idx,
-                        alpha=self.alpha, size_delta=self.size_delta
-                    )
-                    x_merged = v_merged
-                except Exception:
-                    x_merged, size_info = self._merge_v_mean(x, keep_idx, assign_idx)
-            else:
-                x_merged, size_info = self._merge_v_mean(x, keep_idx, assign_idx)
+            x_merged, size_info = size_weighted_merge_v(
+                x=x, keep_idx=keep_idx, assign_idx=assign_idx, alpha=self.alpha, size_delta=self.size_delta
+            )
 
-        after_merge_len = int(x_merged.size(1))
-
-        # 6) Optional unmerge (kept off for in-block; left for completeness)
-        if self.enable_unmerge and _HAS_EXT_MERGE:
+        # Optional unmerge (rare for in-block usage)
+        if enable_unmerge:
             try:
-                x_out = ext_apply_unmerge(x_merged, keep_idx, size_info.get("assign_idx"), size_info)
+                x_out = apply_unmerge(x_merged, keep_idx, assign_idx, size_info)
             except Exception:
                 x_out = x_merged
         else:
             x_out = x_merged
 
-        after_unmerge_len = int(x_out.size(1))
+        # Stats / meter
+        t_post = int(x_out.shape[1])
+        ms = (time.perf_counter() - t0) * 1000.0
 
-        # 7) Stats + cache sizes for proportional attention (O-4)
-        sizes = size_info.get("sizes", None)
-        if isinstance(sizes, torch.Tensor):
-            self.last_log_sizes = torch.log(sizes.clamp_min(1.0))
-        else:
-            self.last_log_sizes = None
-
-        if self.debug_token_stats:
-            print(
-                "[Ours]"
-                + f"[L{layer_idx}] before={before_len}, "
-                + f"after_merge={after_merge_len}, after_unmerge={after_unmerge_len}, "
-                + f"req_r={requested_r}, kept={K_found}, cap={self.token_cap}"
-            )
+        if self.debug:
+            print(f"[Ours][L{layer_idx}] before={t_pre}, after_merge={x_merged.shape[1]}, after_unmerge={t_post}, req_r={requested_r}, kept={K_found}")
 
         if tstats is not None:
             try:
                 tstats.record(
-                    layer_idx=int(layer_idx),
-                    before_len=before_len,
-                    after_merge_len=after_merge_len,
-                    after_unmerge_len=after_unmerge_len if self.enable_unmerge else after_merge_len,
-                    requested_r=int(requested_r) if requested_r is not None else None
+                    layer_idx=layer_idx,
+                    before_len=t_pre,
+                    after_merge_len=int(x_merged.shape[1]),
+                    after_unmerge_len=t_post,
+                    requested_r=int(requested_r) if isinstance(requested_r, int) else None
                 )
             except Exception:
                 pass
 
-        if return_info:
-            return x_out, size_info
+        if (meter is not None) and (hasattr(meter, "add")):
+            try:
+                meter.add(layer=layer_idx, t_pre=t_pre, t_post=t_post, ms=ms)
+            except Exception:
+                pass
+
         return x_out
 
-    # ---- helpers: features, assignment, merge ----
 
-    def _build_features(
-            self,
-            x: torch.Tensor,  # [B,T,C]
-            phi: Optional[torch.Tensor],
-            scores: Optional[torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-          feat: [B,T,Hf] normalized feature for cosine assignment/diversity
-          base: [B,T] base strength for ranking/backfill
-        """
-        if (phi is not None) and phi.numel() > 0:
-            feat = F.normalize(phi, dim=-1)
-            base = (phi.pow(2).sum(dim=-1) + 1e-6).sqrt()
-        else:
-            feat = F.normalize(x, dim=-1)
-            base = (x.pow(2).sum(dim=-1) + 1e-6).sqrt()
-
-        if self.l2_clip_tau > 0.0:
-            base = torch.clamp(base, max=float(self.l2_clip_tau))
-        if scores is not None:
-            base = 0.5 * base + 0.5 * scores
-        if self.temp_eta != 1.0:
-            base = base / float(self.temp_eta)
-        return feat, base
-
-    def _build_assignment(
-            self,
-            feat: torch.Tensor,  # [B,T,Hf], normalized
-            keep_idx: torch.Tensor  # [B,K]
-    ) -> torch.Tensor:
-        """Assign each token to nearest kept center by cosine similarity."""
-        B, T, H = int(feat.size(0)), int(feat.size(1)), int(feat.size(2))
-        K = int(keep_idx.size(1))
-        assign_rows: List[torch.Tensor] = []
-
-        for b in range(B):
-            centers = feat[b, keep_idx[b]]  # [K,H]
-            sims = torch.matmul(feat[b], centers.t())  # [T,K]
-            idx = torch.argmax(sims, dim=1)  # [T]
-            # ensure centers map to themselves
-            idx_scatter = idx.clone()
-            for k in range(K):
-                center_tok = int(keep_idx[b, k].item())
-                if 0 <= center_tok < T:
-                    idx_scatter[center_tok] = k
-            assign_rows.append(idx_scatter)
-
-        return torch.stack(assign_rows, dim=0)  # [B,T]
-
-    def _merge_v_mean(
-            self,
-            x: torch.Tensor,  # [B,T,C]
-            keep_idx: torch.Tensor,  # [B,K]
-            assign_idx: torch.Tensor  # [B,T]
-    ) -> Tuple[torch.Tensor, dict]:
-        """Simple mean aggregation in V space as a robust fallback."""
-        B, T, C = int(x.size(0)), int(x.size(1)), int(x.size(2))
-        K = int(keep_idx.size(1))
-        out = x.new_zeros((B, K, C))
-        sizes = x.new_zeros((B, K))
-
-        for b in range(B):
-            idx = assign_idx[b]  # [T]
-            out_b = out[b]  # [K,C]
-            sizes_b = sizes[b]  # [K]
-            out_b.index_add_(0, idx, x[b])  # sum values per cluster
-            ones = torch.ones(T, dtype=x.dtype, device=x.device)
-            sizes_b.index_add_(0, idx, ones)  # count per cluster
-            denom = sizes_b.clamp_min(1.0).unsqueeze(-1)  # [K,1]
-            out[b] = out_b / denom
-
-        size_info = {"assign_idx": assign_idx, "keep_idx": keep_idx, "sizes": sizes}
-        return out, size_info
-
-
-# ---------------------- proportional attention (O-4) -------------------------
-
-class _SizeState(object):
-    """Holds per-batch token sizes for proportional attention."""
-
-    def __init__(self) -> None:
-        self.current = None  # type: Optional[torch.Tensor]  # [B, N] or None
-
-
-class ProportionalSelfAttention(nn.Module):
-    """
-    Wrap timm Attention to add log(size) bias to key dimension of attention logits.
-    If size state is missing or mismatched, falls back to zero bias.
-    """
-
-    def __init__(self, attn: nn.Module, size_state: _SizeState) -> None:
-        super().__init__()
-        # copy essential parts from timm Attention
-        self.qkv = attn.qkv
-        self.num_heads = int(attn.num_heads)
-        self.scale = float(getattr(attn, "scale", 1.0))
-        self.attn_drop = attn.attn_drop
-        self.proj = attn.proj
-        self.proj_drop = attn.proj_drop
-        self._size_state = size_state
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, C = x.shape
-        qkv = self.qkv(x)  # [B, N, 3*C]
-        head_dim = C // self.num_heads
-        scale = self.scale if self.scale is not None else (1.0 / float(head_dim) ** 0.5)
-        qkv = qkv.reshape(B, N, 3, self.num_heads, head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, h, N, d]
-
-        logits = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, h, Nq, Nk]
-
-        # Add log-size bias along key dimension
-        sizes = self._size_state.current  # [B, Nk] or None
-        if isinstance(sizes, torch.Tensor) and sizes.dim() == 2 and sizes.size(0) == B and sizes.size(1) == k.size(-2):
-            log_s = torch.log(sizes.clamp_min(1e-6))
-            logits = logits + log_s.view(B, 1, 1, sizes.size(1))
-
-        attn = logits.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, N, C)
-        out = self.proj(out)
-        out = self.proj_drop(out)
-        return out
-
-
-# -------------------------- in-block wiring (O-1) ----------------------------
+# ============================ In-block wrapper ===============================
 
 class OursBlockWrapper(nn.Module):
     """
-    ViT Block wrapper (in-block reduction):
-      1) x = x + Attn(norm1(x))                 (optionally with proportional bias)
-      2) x = reducer(x, r)                      [Attn -> Reduce -> MLP]
-      3) x = x + MLP(norm2(x))
+    Insert Ours reduction BETWEEN Attention and MLP in a timm ViT block:
+      x = x + drop(attn(norm1(x)))
+      x = ours.reduce(x)             # <--- here (token reduction)
+      x = x + drop(mlp(norm2(x)))
+    This wrapper assumes the block has attributes: norm1, attn, norm2, mlp,
+    and optionally drop_path, ls1/ls2 or gamma_{1,2}/gamma{1,2}.
     """
 
     def __init__(
-            self,
-            orig_block: nn.Module,
-            layer_idx: int,
-            reducer: OursAttention,
-            r_per_layer: Callable[[int], Optional[int]],
-            size_state: "_SizeState",
-            prop_attn: bool = False,
-            debug: bool = False
+        self,
+        orig_block: nn.Module,
+        *,
+        layer_idx: int,
+        reducer: OursAttention,
+        # reducer knobs
+        token_cap: str = "on",
+        debug_token_stats: bool = False,
+        tau_adapt: bool = True,
+        quota_frac: float = 0.30,
+        cand_extra: int = 16,
+        merge_mode: str = "v",
+        alpha: float = 0.15,
+        size_delta: float = 0.0,
+        # schedule
+        get_r_for_layer: Optional[Callable[[int], Optional[int]]] = None,
+        # runtime
+        enable_unmerge: bool = False,
+        meter: Optional["BlockMeter"] = None
     ) -> None:
         super().__init__()
         self.layer_idx = int(layer_idx)
         self.reducer = reducer
-        self._r_fn = r_per_layer
-        self.size_state = size_state
-        self.prop_attn = bool(prop_attn)
-        self.debug = bool(debug)
+        self.token_cap = token_cap
+        self.debug = bool(debug_token_stats)
+        self.tau_adapt = bool(tau_adapt)
+        self.quota_frac = float(quota_frac)
+        self.cand_extra = int(cand_extra)
+        self.merge_mode = str(merge_mode).lower()
+        self.alpha = float(alpha)
+        self.size_delta = float(size_delta)
+        self.get_r_for_layer = get_r_for_layer
+        self.enable_unmerge = bool(enable_unmerge)
+        self.meter = meter
 
-        # keep original submodules
+        # Capture original submodules
         self.norm1 = orig_block.norm1
+        self.attn = orig_block.attn
         self.norm2 = orig_block.norm2
         self.mlp = orig_block.mlp
         self.drop_path = getattr(orig_block, "drop_path", nn.Identity())
 
-        # attention (wrap for proportional attention if requested)
-        self.attn = ProportionalSelfAttention(orig_block.attn, size_state) if self.prop_attn else orig_block.attn
-
-        # optional layer-scale variants
+        # Optional layer-scale variants
         self.ls1 = getattr(orig_block, "ls1", None)
         self.ls2 = getattr(orig_block, "ls2", None)
         self.gamma_1 = getattr(orig_block, "gamma_1", None)
@@ -394,7 +293,7 @@ class OursBlockWrapper(nn.Module):
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Attention branch (may include proportional bias from previous sizes)
+        # Attention branch
         residual = x
         x1 = self.norm1(x)
         x1 = self.attn(x1)
@@ -403,25 +302,28 @@ class OursBlockWrapper(nn.Module):
         x = residual + x1
 
         # Ours reduction (between Attn and MLP)
-        req_r = self._r_fn(self.layer_idx)
-        x, info = self.reducer(x, layer_idx=self.layer_idx, requested_r=req_r, return_info=True)
+        req_r = self.get_r_for_layer(self.layer_idx) if self.get_r_for_layer is not None else None
+        x = self.reducer(
+            x,
+            layer_idx=self.layer_idx,
+            requested_r=req_r,
+            scores=None,  # you can pass attn key-norms here if you have them
+            enable_unmerge=self.enable_unmerge,
+            meter=self.meter
+        )
 
-        # Update size state for NEXT block's attention
-        sizes = info.get("sizes", None) if isinstance(info, dict) else None
-        if isinstance(sizes, torch.Tensor):
-            self.size_state.current = sizes  # [B, K]
-        else:
-            self.size_state.current = None
-
-        # MLP branch on reduced tokens
+        # MLP branch (on reduced tokens)
         residual2 = x
         x2 = self.norm2(x)
         x2 = self.mlp(x2)
         x2 = self._apply_layer_scale2(x2)
         x2 = self.drop_path(x2)
         x = residual2 + x2
+
         return x
 
+
+# ========================== Installer for wrappers ===========================
 
 def _find_blocks(model: nn.Module):
     for name in ["blocks", "stages"]:
@@ -431,31 +333,28 @@ def _find_blocks(model: nn.Module):
 
 
 def apply_ours_inblock(
-        model: nn.Module,
-        *,
-        r: int,
-        layers: Optional[List[int]],
-        # reducer knobs (must match OursAttention.__init__)
-        token_cap: str = "on",
-        debug_token_stats: bool = False,
-        tau_adapt: bool = True,
-        enable_unmerge: bool = False,
-        selector: str = "hquota_ff",
-        hq_quota: float = 0.0,
-        cand_extra: int = 0,
-        merge_mode: str = "v",
-        alpha: float = 0.0,
-        beta0: float = 0.0,
-        top_r: int = 0,
-        l2_clip_tau: float = 0.0,
-        temp_eta: float = 1.0,
-        size_delta: float = 0.0,
-        match_feature: str = "xnorm",
-        prop_attn: bool = False  # O-4 toggle
+    model: nn.Module,
+    *,
+    r: int,
+    r_list: Optional[List[int]] = None,
+    layers: Optional[List[int]] = None,
+    token_cap: str = "on",
+    debug_token_stats: bool = False,
+    tau_adapt: bool = True,
+    enable_unmerge: bool = False,
+    selector: str = "hquota_ff",
+    hq_q: float = 0.30,
+    cand_extra: int = 16,
+    merges: str = "v",
+    alpha: float = 0.15,
+    size_delta: float = 0.0,
+    match_feature: str = "xnorm",   # reserved (keys vs xnorm)
+    prop_attn: bool = False,        # reserved (not used in this minimal file)
+    select_mode: str = "keep"       # "keep" or "drop"
 ) -> nn.Module:
     """
-    Replace timm blocks so reduction happens between Attention and MLP.
-    Optionally enable proportional attention (log-size bias) for next block.
+    Replace timm ViT blocks so reduction happens in-block (Attn -> Ours -> MLP).
+    Supports per-layer r_list schedule; if absent, uses scalar r and layers set.
     """
     blocks = _find_blocks(model)
     if blocks is None:
@@ -463,59 +362,76 @@ def apply_ours_inblock(
             print("[Ours][WARN] no transformer blocks found; in-block wiring skipped.")
         return model
 
-    # Single reducer reused across blocks
+    # Build per-layer r map
+    n_blocks = len(list(blocks))
+    if r_list is not None and len(r_list) > 0:
+        if len(r_list) < n_blocks:
+            last = int(r_list[-1])
+            r_map = [int(v) for v in r_list] + [last] * (n_blocks - len(r_list))
+        else:
+            r_map = [int(v) for v in r_list[:n_blocks]]
+    else:
+        target = set(layers) if layers is not None else None
+        r_map = [int(r) if (target is None or i in target) else 0 for i in range(n_blocks)]
+
+    # Shared reducer instance
     reducer = OursAttention(
         token_cap=token_cap,
         debug_token_stats=debug_token_stats,
         tau_adapt=tau_adapt,
-        enable_unmerge=enable_unmerge,
-        selector=selector,
-        hq_quota=hq_quota,
+        quota_frac=hq_q,
         cand_extra=cand_extra,
-        merge_mode=merge_mode,
+        merge_mode=merges,
         alpha=alpha,
-        beta0=beta0,
-        top_r=top_r,
-        l2_clip_tau=l2_clip_tau,
-        temp_eta=temp_eta,
         size_delta=size_delta,
-        match_feature=match_feature
+        select_mode=select_mode
     )
 
-    # Shared size state across blocks (for proportional attention)
-    size_state = _SizeState()
+    # Shared meter
+    meter = BlockMeter() if BlockMeter is not None else None
 
-    target = set(layers) if layers is not None else None
-
-    def r_for_layer(L: int) -> Optional[int]:
-        if target is None:
-            return int(r)
-        return int(r) if L in target else None
+    # Closure for per-layer r
+    def _r_for_layer(L: int) -> Optional[int]:
+        v = r_map[L] if (0 <= L < len(r_map)) else 0
+        return v if v > 0 else None
 
     # Wrap each block
     new_blocks = []
     for i, blk in enumerate(list(blocks)):
-        wrapped = OursBlockWrapper(
-            orig_block=blk,
-            layer_idx=i,
-            reducer=reducer,
-            r_per_layer=r_for_layer,
-            size_state=size_state,
-            prop_attn=bool(prop_attn),
-            debug=debug_token_stats
-        )
-        new_blocks.append(wrapped)
+        if r_map[i] > 0:
+            wrapped = OursBlockWrapper(
+                orig_block=blk,
+                layer_idx=i,
+                reducer=reducer,
+                token_cap=token_cap,
+                debug_token_stats=debug_token_stats,
+                tau_adapt=tau_adapt,
+                quota_frac=hq_q,
+                cand_extra=cand_extra,
+                merge_mode=merges,
+                alpha=alpha,
+                size_delta=size_delta,
+                get_r_for_layer=_r_for_layer,
+                enable_unmerge=enable_unmerge,
+                meter=meter
+            )
+            new_blocks.append(wrapped)
+        else:
+            new_blocks.append(blk)
 
-    # Assign back
+    # Reassign back
     if isinstance(blocks, nn.Sequential):
         model.blocks = nn.Sequential(*new_blocks)  # type: ignore
     else:
-        # try ModuleList-like assignment; fallback to setattr per index-name
         try:
             for i, w in enumerate(new_blocks):
                 blocks[i] = w  # type: ignore
         except Exception:
             for i, w in enumerate(new_blocks):
                 setattr(blocks, str(i), w)
+
+    # Expose meter for final summary
+    if meter is not None:
+        setattr(model, "_ours_meter", meter)
 
     return model
