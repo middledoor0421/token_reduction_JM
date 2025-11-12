@@ -15,6 +15,7 @@ from torchvision import datasets
 from tqdm import tqdm
 
 from core import token_stats as tstats
+from core.schedule import make_r_map_from_cli, pretty_r_map
 from methods.tome_adapter.plugin import apply_tome_with_hooks
 from methods.ours.attn import apply_ours_inblock
 
@@ -69,6 +70,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--layers", type=str, default="0,1,2", help="comma-separated target layers; empty means all")
     p.add_argument("--r", type=int, default=13, help="requested removals per targeted layer")
     p.add_argument("--r-list", type=str, default=None, help='comma-separated r per layer (overrides --r), e.g. "13,13,13,9,9,5"')
+    p.add_argument("--print-r-map", action="store_true",
+                    help="Print the per-layer r_map for debugging.")
 
     # Token-cap toggle and stats
     p.add_argument("--token-cap", type=str, default="on", choices=["on", "off"], help="on: allow <r; off: force exactly r")
@@ -213,18 +216,35 @@ def main():
     layers = parse_layers(args.layers)
     r_list = parse_int_list(getattr(args, "r_list", None))
 
+    # --- r_map build & attach (single source of truth) ---
+    blocks = find_transformer_blocks(model)
+    n_blocks = len(list(blocks)) if blocks is not None else 0
+
+    # dataset-level stats: report table has fixed rows
+    tstats.set_total_layers(n_blocks if n_blocks > 0 else None)
+
+    # unify r schedule: r_list > layers+r > uniform r
+    r_map = make_r_map_from_cli(
+        n_blocks=n_blocks,
+        r=args.r,
+        r_list_csv=getattr(args, "r_list", None),
+        layers_csv=getattr(args, "layers", None),
+    )
+    setattr(model, "_r_map", r_map)  # later plugins/wrappers will read this
+
+    if getattr(args, "print_r_map", False):
+        print("[r_map]", pretty_r_map(r_map))
+    # --- end r_map build ---
+
     # Apply method
     if args.method == "tome":
         model = apply_tome_with_hooks(
-            model=model,
-            r=args.r,
-            r_list=r_list,
-            layers=layers,
-            token_cap=args.token_cap,
-            debug_token_stats=args.debug_token_stats,
+            model,
+            token_cap=args.token_cap,  # ToMe 내부는 r_map의 r을 그대로 사용(50% cap만 적용)
             cls_protect=(args.cls_protect.lower() == "true"),
             match_feature=args.match_feature,
-            prop_attn=(args.prop_attn.lower() == "true")
+            prop_attn=(args.prop_attn.lower() == "true"),
+            debug_token_stats=args.debug_token_stats,
         )
     elif args.method == "ours":
         model = apply_ours_inblock(

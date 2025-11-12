@@ -1,252 +1,324 @@
 # methods/tome_adapter/plugin.py
 # Python 3.9 compatible. Comments in English only.
-# Upstream ToMe parity adapter:
-# - Preserve Attn -> Merge -> MLP inside upstream ToMe (no extra merges here)
-# - Support per-layer r schedule (r_list) and/or scalar r + layers
-# - Register LOGGING-ONLY hooks (dataset-avg stats are handled elsewhere)
 
-from typing import Optional, List, Dict, Any
-import types
+from typing import Optional, List, Any, Callable
 import torch
+import torch.nn as nn
 
+# Origin ToMe merge operators
+from tome.merge import (
+    bipartite_soft_matching,  # (merge, unmerge)
+    merge_wavg,               # size-weighted merge
+    merge_source              # optional trace
+)
+
+# Optional dataset-avg token stats (your repo)
 try:
     from core import token_stats as tstats
 except Exception:
     tstats = None
 
-# ---- project registry (for legacy launcher compatibility) -------------------
+# Unified schedule builder (main.py should set model._r_map; this is fallback)
 try:
-    from core.registry import register, TokenReducerPlugin
+    from core.schedule import make_r_map
 except Exception:
-    def register(_name):
-        def deco(cls):
-            return cls
-        return deco
-    class TokenReducerPlugin(object):
-        def __init__(self, cfg):
-            self.cfg = cfg
-        def attach(self, model):
-            return model
-        def finalize(self):
-            pass
-# -----------------------------------------------------------------------------
+    make_r_map = None
 
 
-def apply_tome_with_hooks(
-    model: torch.nn.Module,
-    r: int,
-    r_list: Optional[List[int]] = None,   # NEW: per-layer schedule overrides scalar r
-    layers: Optional[List[int]] = None,   # optional target layer indices (ignored if r_list provided)
-    token_cap: str = "on",                # ignored (keep upstream parity)
-    debug_token_stats: bool = False,
-    cls_protect: bool = True,             # tagging only
-    match_feature: str = "xnorm",         # tagging only
-    prop_attn: bool = False               # forwarded to tome.patch if supported
-) -> torch.nn.Module:
-    """
-    Patch timm ViT with upstream ToMe (in-place), inject per-block r, and
-    log token lengths per block. No extra merges or behavior changes.
+# ---------------- utilities ----------------
 
-    Args:
-      model: timm ViT model.
-      r: scalar merges per targeted block (used when r_list is None).
-      r_list: per-layer merges list. If provided, overrides r/layers.
-      layers: target layer indices for scalar-r mode. None means all blocks.
-      token_cap: ignored to preserve parity.
-      debug_token_stats: print before/after lengths per block if True.
-      cls_protect/match_feature/prop_attn: kept for CLI parity.
-
-    Returns:
-      model (same object), patched and hooked.
-    """
-    import tome  # local upstream ToMe package
-
-    # 1) Upstream ToMe patch (IN-PLACE). Do NOT assign return value.
-    try:
-        tome.patch.timm(model, prop_attn=bool(prop_attn))
-    except TypeError:
-        tome.patch.timm(model)
-
-    # 2) Locate transformer blocks
-    blocks = _find_blocks(model)
-    if blocks is None:
-        if debug_token_stats:
-            print("[ToMe][WARN] no transformer blocks found ('blocks'/'stages').")
-        return model
-
-    n_blocks = len(list(blocks))
-
-    # 3) Build per-layer r_map
-    r_map: List[int] = []
-    if r_list is not None and len(r_list) > 0:
-        if len(r_list) < n_blocks:
-            last = int(r_list[-1])
-            r_map = [int(v) for v in r_list] + [last] * (n_blocks - len(r_list))
-        else:
-            r_map = [int(v) for v in r_list[:n_blocks]]
-    else:
-        layer_set = set(layers) if layers is not None else None
-        for i in range(n_blocks):
-            r_map.append(int(r) if (layer_set is None or i in layer_set) else 0)
-
-    # 4) Initial r tagging (broad compatibility)
-    _set_r_attr(model, 0)
-    for i, blk in enumerate(list(blocks)):
-        r_i = int(r_map[i])
-        _set_r_attr(blk, r_i)
-        attn = getattr(blk, "attn", None)
-        if attn is not None:
-            _set_r_attr(attn, r_i)
-        if debug_token_stats:
-            rb = getattr(blk, "r", None)
-            ra = getattr(attn, "r", None) if attn is not None else None
-            print(f"[ToMe][Init] L{i}: r_blk={rb}, r_attn={ra}")
-
-    # 5) (Optional) verify patching
-    if debug_token_stats:
-        _verify_tome_patch(model, blocks)
-
-    # 6) Wrap each block.forward to (a) set model.r for this block, (b) log lengths
-    def make_forward(_blk, _L, _orig):
-        def new_forward(self, x):
-            # before length
-            t_prev = None
-            if isinstance(x, torch.Tensor) and x.dim() == 3:
-                t_prev = int(x.shape[1])
-
-            # set r for this block (some ToMe versions read model.r at runtime)
-            r_here = int(r_map[_L])
-            _set_r_attr(model, r_here)   # global
-            _set_r_attr(_blk, r_here)    # block
-            attn_local = getattr(_blk, "attn", None)
-            if attn_local is not None:
-                _set_r_attr(attn_local, r_here)
-
-            # original forward (ToMe runs Attn -> Merge -> MLP inside)
-            out = _orig(x)
-
-            # after length + logging
-            if isinstance(out, torch.Tensor) and out.dim() == 3 and t_prev is not None:
-                t_cur = int(out.shape[1])
-                req = r_here if r_here > 0 else None
-                if debug_token_stats:
-                    print(f"[ToMe][L{_L}] before={t_prev}, after={t_cur}, delta={t_prev - t_cur}, req_r={req}")
-                if tstats is not None:
-                    try:
-                        tstats.record(
-                            layer_idx=_L,
-                            before_len=t_prev,
-                            after_merge_len=t_cur,
-                            after_unmerge_len=None,
-                            requested_r=req
-                        )
-                    except Exception:
-                        pass
-            return out
-        return new_forward
-
-    for i, blk in enumerate(list(blocks)):
-        orig_forward = blk.forward
-        # bind wrapper as a method; call orig via closure to avoid recursion
-        def _orig_bound(x, _orig=orig_forward):
-            return _orig(x)
-        wrapped = make_forward(blk, i, _orig_bound)
-        blk.forward = types.MethodType(wrapped, blk)
-
-    # Expose schedule for inspection (optional)
-    model._tome_r_map = r_map
-    model._tome_debug = bool(debug_token_stats)
-
-    return model
-
-
-# ------------------------------ helpers --------------------------------------
-
-def _find_blocks(model: torch.nn.Module):
+def _find_transformer_blocks(model: nn.Module):
+    """Return container holding transformer blocks (timm ViT/DeiT)."""
     for name in ["blocks", "stages"]:
         if hasattr(model, name):
             return getattr(model, name)
     return None
 
 
-def _set_r_attr(obj: object, r_val: int) -> None:
-    """Set 'r' on various ToMe versions (model/block/attn) safely."""
-    if obj is None:
-        return
-    for nm in ("r", "tome_r", "_tome_r"):
-        try:
-            setattr(obj, nm, int(r_val))
-        except Exception:
-            pass
-    for nm in ("tome_info", "_tome_info"):
-        info = getattr(obj, nm, None)
-        if info is not None:
+def _ensure_r_map(model: nn.Module,
+                  n_blocks: int,
+                  r: Optional[int],
+                  r_list: Optional[List[int]],
+                  layers: Optional[List[int]]) -> List[int]:
+    """Prefer model._r_map; else build from args."""
+    r_map = getattr(model, "_r_map", None)
+    if isinstance(r_map, list) and len(r_map) == n_blocks:
+        return r_map
+    if make_r_map is None:
+        return [0] * n_blocks
+    return make_r_map(n_blocks=n_blocks, r=r, r_list=r_list, layers=layers)
+
+
+# ------------- patched Attention / Block / VT -------------
+
+class _ToMeAttention(nn.Module):
+    """Drop-in replacement for timm.models.vision_transformer.Attention."""
+    def __init__(self, attn: nn.Module) -> None:
+        super().__init__()
+        self.__dict__["_wrapped"] = attn
+        self.qkv = attn.qkv
+        self.proj = attn.proj
+        self.proj_drop = getattr(attn, "proj_drop", nn.Identity())
+        self.attn_drop = getattr(attn, "attn_drop", nn.Identity())
+        self.num_heads = attn.num_heads
+        self.scale = attn.scale
+
+    def forward(self, x: torch.Tensor, size: torch.Tensor = None):
+        B, N, C = x.shape
+        qkv = (self.qkv(x)
+               .reshape(B, N, 3, self.num_heads, C // self.num_heads)
+               .permute(2, 0, 3, 1, 4))
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B,h,N,d]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        # proportional attention (size bias)
+        if size is not None:
+            attn = attn + size.log()[:, None, None, :, 0]
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        # ToMe uses k-mean across heads as matching metric
+        return x, k.mean(1)
+
+
+class _ToMeBlock(nn.Module):
+    """Drop-in replacement for timm.models.vision_transformer.Block.
+    Apply ToMe between attn and mlp; record stats also when r==0.
+    """
+    def __init__(self, block: nn.Module, shared_info: dict) -> None:
+        super().__init__()
+        self.__dict__["_wrapped"] = block
+        self._tome_info = shared_info
+
+        self.norm1 = block.norm1
+        self.attn = block.attn
+        self.norm2 = block.norm2
+        self.mlp = block.mlp
+
+        self.drop_path = getattr(block, "drop_path", None)
+        self.drop_path1 = getattr(block, "drop_path1", None)
+        self.drop_path2 = getattr(block, "drop_path2", None)
+
+    def _dp1(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_path1 is not None:
+            return self.drop_path1(x)
+        if self.drop_path is not None:
+            return self.drop_path(x)
+        return x
+
+    def _dp2(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_path2 is not None:
+            return self.drop_path2(x)
+        if self.drop_path is not None:
+            return self.drop_path(x)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1) Attention (metric for matching)
+        attn_size = self._tome_info["size"] if self._tome_info["prop_attn"] else None
+        x_attn, metric = self.attn(self.norm1(x), attn_size)
+        x = x + self._dp1(x_attn)
+
+        # 2) Per-layer r from queue
+        r_queue = self._tome_info["r"]
+        req_r = int(r_queue.pop(0)) if isinstance(r_queue, list) and len(r_queue) > 0 else 0
+
+        # 2.5) Length before merge (for stats)
+        T0 = 0
+        if isinstance(x, torch.Tensor) and x.dim() == 3:
             try:
-                setattr(info, "r", int(r_val))
+                T0 = int(x.shape[1])
             except Exception:
-                pass
+                T0 = 0
+
+        # 3) Merge (or baseline record if r==0)
+        if req_r > 0:
+            merge, _ = bipartite_soft_matching(
+                metric,
+                r=req_r,
+                class_token=self._tome_info["class_token"],
+                distill_token=self._tome_info["distill_token"],
+            )
+
+            if self._tome_info["trace_source"]:
+                self._tome_info["source"] = merge_source(
+                    merge, x, self._tome_info["source"]
+                )
+
+            x, self._tome_info["size"] = merge_wavg(
+                merge, x, self._tome_info["size"]
+            )
+
+            # after length
+            T1 = int(x.shape[1]) if isinstance(x, torch.Tensor) and x.dim() == 3 else T0
+
+            if tstats is not None:
+                try:
+                    tstats.record(
+                        layer_idx=self._tome_info["layer_ptr"],
+                        before_len=T0,
+                        after_merge_len=T1,
+                        after_unmerge_len=T1,
+                        requested_r=req_r
+                    )
+                except Exception:
+                    pass
+        else:
+            # >>> Added: record baseline when no reduction on this layer <<<
+            if tstats is not None:
+                try:
+                    tstats.record(
+                        layer_idx=self._tome_info["layer_ptr"],
+                        before_len=T0,
+                        after_merge_len=T0,
+                        after_unmerge_len=T0,
+                        requested_r=0
+                    )
+                except Exception:
+                    pass
+
+        # 4) MLP
+        x = x + self._dp2(self.mlp(self.norm2(x)))
+        return x
 
 
-def _verify_tome_patch(model: torch.nn.Module, blocks) -> None:
+def _make_tome_vt_class(base_cls):
+    """Subclass VT to reset r-queue/size/source per forward (origin ToMe style)."""
+    class _ToMeVisionTransformer(base_cls):
+        def forward(self, *args: Any, **kw: Any) -> torch.Tensor:
+            blocks = _find_transformer_blocks(self)
+            n_blocks = len(list(blocks)) if blocks is not None else 0
+            r_map = getattr(self, "_r_map", [0] * n_blocks)
+
+            # init ToMe state for this forward
+            self._tome_info["r"] = list(r_map)
+            self._tome_info["size"] = None
+            self._tome_info["source"] = None
+            self._tome_info["layer_ptr"] = 0
+
+            out = super().forward(*args, **kw)
+
+            # clear queue
+            self._tome_info["r"] = []
+            return out
+    return _ToMeVisionTransformer
+
+
+# ------------- public entry -------------
+
+def apply_tome_with_hooks(
+    model: nn.Module,
+    *,
+    r: Optional[int] = None,
+    r_list: Optional[List[int]] = None,
+    layers: Optional[List[int]] = None,
+    token_cap: str = "off",          # ToMe merges exactly r (50% cap inside)
+    cls_protect: bool = True,
+    match_feature: str = "kmean",
+    prop_attn: bool = True,
+    trace_source: bool = False,
+    debug_token_stats: bool = False
+) -> nn.Module:
+    """
+    Patch timm VisionTransformer to run ToMe in-block (attn->merge->mlp).
+    Layer-wise r is taken from model._r_map, set by main via core.schedule.
+    """
+    blocks = _find_transformer_blocks(model)
+    if blocks is None:
+        if debug_token_stats:
+            print("[ToMe] WARN: no transformer blocks found; skipping patch.")
+        return model
+    n_blocks = len(list(blocks))
+
+    # Ensure r_map exists on the model
+    r_map = _ensure_r_map(model, n_blocks, r, r_list, layers)
+    setattr(model, "_r_map", r_map)
+
+    # Shared ToMe state
+    class_token = bool(getattr(model, "cls_token", None) is not None)
+    distill_token = bool(getattr(model, "dist_token", None) is not None)
+    model._tome_info = {
+        "r": [],
+        "size": None,
+        "source": None,
+        "trace_source": bool(trace_source),
+        "prop_attn": bool(prop_attn),
+        "class_token": bool(cls_protect and class_token),
+        "distill_token": bool(cls_protect and distill_token),
+        "layer_ptr": 0,
+    }
+
+    # Swap model class to reset ToMe state each forward (if VT)
     try:
-        b0 = list(blocks)[0]
-        attn0 = getattr(b0, "attn", None)
-        print("[ToMe][Check] block0.attn =", type(attn0))
-        print("[ToMe][Check] model.r   =", getattr(model, "r", None),
-              " block0.r =", getattr(b0, "r", None))
+        from timm.models.vision_transformer import VisionTransformer as _VT
+        base_cls = model.__class__
+        if issubclass(base_cls, _VT):
+            model.__class__ = _make_tome_vt_class(base_cls)
     except Exception:
         pass
 
-
-# ------------------------- registry plugin (legacy path) ---------------------
-
-@register("tome")
-class TomePlugin(TokenReducerPlugin):
-    """Registry-compatible ToMe plugin that calls the adapter above."""
-    name = "tome"
-
-    def __init__(self, cfg):
-        super().__init__(cfg)
-
-    @staticmethod
-    def _parse_layers(v):
-        if v is None:
-            return None
-        if isinstance(v, list):
-            return [int(x) for x in v]
-        if isinstance(v, str):
-            s = v.strip()
-            if len(s) == 0:
-                return None
-            return [int(p.strip()) for p in s.split(",") if p.strip() != ""]
-        return None
-
-    @staticmethod
-    def _parse_r_list(v):
-        if v is None:
-            return None
-        if isinstance(v, list):
-            return [int(x) for x in v]
-        if isinstance(v, str):
-            s = v.strip()
-            if len(s) == 0:
-                return None
-            return [int(p.strip()) for p in s.split(",") if p.strip() != ""]
-        return None
-
-    def attach(self, model):
-        cfg = self.cfg if isinstance(self.cfg, dict) else {}
-        return apply_tome_with_hooks(
-            model=model,
-            r=int(cfg.get("r", 13)),
-            r_list=self._parse_r_list(cfg.get("r_list", None)),     # NEW
-            layers=self._parse_layers(cfg.get("layers", None)),
-            token_cap=str(cfg.get("token_cap", "on")),
-            debug_token_stats=bool(cfg.get("debug_token_stats", False)),
-            cls_protect=bool(cfg.get("cls_protect", True)),
-            match_feature=str(cfg.get("match_feature", "xnorm")),
-            prop_attn=bool(cfg.get("prop_attn", False))
-        )
-
-    def finalize(self):
+    # Replace Attention modules first
+    try:
+        from timm.models.vision_transformer import Attention as _Attn
+        for m in model.modules():
+            if isinstance(m, _Attn) and not isinstance(m, _ToMeAttention):
+                parent = _find_parent(model, m)
+                if parent is not None:
+                    name = _child_name(parent, m)
+                    setattr(parent, name, _ToMeAttention(m))
+    except Exception:
         pass
+
+    # Replace Blocks with ToMe blocks
+    try:
+        from timm.models.vision_transformer import Block as _Block
+        for m in model.modules():
+            if isinstance(m, _Block) and not isinstance(m, _ToMeBlock):
+                parent = _find_parent(model, m)
+                if parent is not None:
+                    name = _child_name(parent, m)
+                    setattr(parent, name, _ToMeBlock(m, model._tome_info))
+    except Exception:
+        pass
+
+    # After-block hook to advance layer_ptr
+    def _after_block_hook(module: nn.Module, inputs: Any, output: Any):
+        if isinstance(module, _ToMeBlock):
+            try:
+                module._tome_info["layer_ptr"] += 1
+            except Exception:
+                pass
+        return None
+
+    handles = []
+    for blk in model.modules():
+        if isinstance(blk, _ToMeBlock):
+            handles.append(blk.register_forward_hook(_after_block_hook))
+    setattr(model, "_tome_handles", handles)
+
+    if debug_token_stats:
+        print("[ToMe] patched with origin operators; r_map len =", len(r_map))
+
+    return model
+
+
+# -------- helpers to navigate module tree --------
+
+def _find_parent(root: nn.Module, child: nn.Module) -> Optional[nn.Module]:
+    for m in root.modules():
+        for name, sub in m.named_children():
+            if sub is child:
+                return m
+    return None
+
+
+def _child_name(parent: nn.Module, child: nn.Module) -> Optional[str]:
+    for name, sub in parent.named_children():
+        if sub is child:
+            return name
+    return None

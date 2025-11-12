@@ -21,7 +21,7 @@ except Exception:
 
 try:
     # Selector (drop-r + vectorized head-quota)
-    from .selectors.hquota import select_hquota_ff
+    from .selectors.hquota_ff import select_hquota_ff
 except Exception:
     def select_hquota_ff(phi, K, quota_frac=0.0, cand_extra=0, force_k=False,
                          cls_protect=True, scores=None, mix_alpha=0.5,

@@ -273,3 +273,64 @@ def select_hquota_ff(
         out[b] = torch.tensor(keep_b, dtype=torch.long, device=device)
 
     return out
+
+def select(
+    x,              # torch.Tensor [B,T,H] head-profile or feature used by the selector
+    mode,           # "keep" or "drop"
+    k,              # target keep count (when mode=="keep")
+    r,              # target drop count (when mode=="drop")
+    cls_protect=True,
+    token_cap=True,
+    debug=False,
+    **kwargs
+):
+    """
+    Canonical entry consumed by selectors/__init__.py.
+    Delegates to select_hquota_ff(...) with arguments mapped from kwargs.
+    """
+    m = str(mode).lower()
+    T = int(x.size(1))
+    if m == "drop":
+        k_eff = max(1, T - int(r))
+    else:
+        k_eff = int(k)
+
+    return select_hquota_ff(
+        phi=x,
+        K=k_eff,
+        quota_frac=float(kwargs.get("hq_q", 0.0)),
+        cand_extra=int(kwargs.get("cand_extra", 0)),
+        force_k=(not bool(token_cap) and m == "keep"),
+        cls_protect=bool(cls_protect),
+        scores=kwargs.get("scores", None),
+        mix_alpha=float(kwargs.get("mix_alpha", 0.5)),
+        select_mode=m,
+    )
+
+def select_keep_k(
+    x,
+    k,
+    cls_protect=True,
+    token_cap=True,
+    debug=False,
+    **kwargs
+):
+    return select(
+        x=x, mode="keep", k=int(k), r=0,
+        cls_protect=cls_protect, token_cap=token_cap, debug=debug, **kwargs
+    )
+
+def select_drop_r(
+    x,
+    r,
+    cls_protect=True,
+    token_cap=True,
+    debug=False,
+    **kwargs
+):
+    T = int(x.size(1))
+    k_eff = max(1, T - int(r))
+    return select(
+        x=x, mode="drop", k=k_eff, r=int(r),
+        cls_protect=cls_protect, token_cap=token_cap, debug=debug, **kwargs
+    )

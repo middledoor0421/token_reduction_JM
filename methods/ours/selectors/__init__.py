@@ -1,26 +1,74 @@
 # methods/ours/selectors/__init__.py
-# -*- coding: utf-8 -*-
-from typing import Callable, Dict
+# Scalable one-place registration for selector plugins.
+# Python 3.9 compatible. Comments in English only.
 
-# 각 selector 구현을 임포트
-from .hquota_ff import select_hquota_ff
-# 필요하면 다른 selector도 여기서 함께 import 하세요.
-# from .topk import select_topk
+import importlib
+from typing import Callable
+from methods.ours.registry import register_selector
 
-# 이름 -> 함수 매핑 테이블
-_SELECTORS: Dict[str, Callable] = {
-    # head-diversity + CLS 보호
-    "hquota":    select_hquota_ff,
-    "hquota_ff": select_hquota_ff,  # 동의어로 접근 가능
-    # "topk":    select_topk,
-}
+# Only keep names here. Add one more string when you add a new selector module.
+SELECTOR_PLUGINS = (
+    "hquota_ff",  # only this one for now
+)
 
-def get_selector(name: str) -> Callable:
+def _make_entry(mod) -> Callable:
     """
-    등록된 selector 함수를 이름으로 찾아 반환.
+    Build a canonical entry: fn(x, mode, k, r, cls_protect, token_cap, debug, **kwargs)
+    It adapts to whatever API the module exposes.
     """
-    try:
-        return _SELECTORS[name]
-    except KeyError:
-        # 사용 가능한 키 리스트도 함께 출력
-        raise ValueError(f"Unknown selector: {name}. Available: {list(_SELECTORS.keys())}")
+    has_select  = hasattr(mod, "select")
+    has_keep    = hasattr(mod, "select_keep_k")
+    has_drop    = hasattr(mod, "select_drop_r")
+    has_low     = hasattr(mod, "select_hquota_ff")  # legacy low-level
+
+    def entry(x, mode, k, r, cls_protect=True, token_cap=True, debug=False, **kwargs):
+        m = str(mode).lower()
+
+        # Prefer a generic 'select'
+        if has_select:
+            return mod.select(
+                x=x, mode=m, k=int(k), r=int(r),
+                cls_protect=bool(cls_protect), token_cap=bool(token_cap),
+                debug=bool(debug), **kwargs
+            )
+
+        # Mode-specific fallbacks
+        if m == "keep" and has_keep:
+            return mod.select_keep_k(
+                x=x, k=int(k),
+                cls_protect=bool(cls_protect), token_cap=bool(token_cap),
+                debug=bool(debug), **kwargs
+            )
+        if m == "drop" and has_drop:
+            return mod.select_drop_r(
+                x=x, r=int(r),
+                cls_protect=bool(cls_protect), token_cap=bool(token_cap),
+                debug=bool(debug), **kwargs
+            )
+
+        # Low-level legacy (keep only)
+        if has_low and m == "keep":
+            K = int(k)
+            return mod.select_hquota_ff(
+                phi=x, K=K,
+                quota_frac=float(kwargs.get("hq_q", 0.0)),
+                cand_extra=int(kwargs.get("cand_extra", 0)),
+                force_k=(not bool(token_cap)),
+                cls_protect=bool(cls_protect),
+                scores=kwargs.get("scores", None),
+                mix_alpha=float(kwargs.get("mix_alpha", 0.5)),
+                select_mode="keep",
+            )
+
+        raise RuntimeError(
+            "Selector entry not found. Expected one of {select, select_keep_k/select_drop_r, select_hquota_ff}."
+        )
+
+    return entry
+
+_pkg = __name__  # "methods.ours.selectors"
+for _name in SELECTOR_PLUGINS:
+    _mod = importlib.import_module(f"{_pkg}.{_name}")
+    _entry = _make_entry(_mod)
+    # Most selectors can optionally return (keep_idx, assign_idx).
+    register_selector(_name, returns_assign=True)(_entry)
